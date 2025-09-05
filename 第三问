@@ -1,0 +1,697 @@
+import os
+import warnings
+import argparse
+import re
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve
+)
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+
+# ------------------------------
+# I/O 与工具函数
+# ------------------------------
+
+def read_csv_robust(path: str) -> pd.DataFrame:
+    encodings = ["utf-8-sig", "gb18030", "gbk", "utf-8"]
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
+
+def ensure_dir(path: str) -> None:
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def infer_threshold(series: pd.Series, base_percent: float = 4.0) -> float:
+    s = series.dropna()
+    if s.empty:
+        return base_percent / 100.0
+    # 若数据以百分数表示，则阈值为4；若为小数，则为0.04
+    if s.median() > 1.0 or s.quantile(0.9) > 1.0:
+        return base_percent
+    return base_percent / 100.0
+
+
+def sanitize_filename(name: str, replacement: str = "_") -> str:
+    # 移除/替换 Windows 非法字符，并规避保留名
+    if name is None:
+        return "untitled"
+    name = str(name)
+    name = re.sub(r'[<>:"/\\|?*]+', replacement, name)
+    name = name.strip().strip(".")
+    if not name:
+        name = "untitled"
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if name.upper() in reserved:
+        name = f"_{name}"
+    # 限长，避免过长文件名
+    return name[:120]
+
+
+# ------------------------------
+# 特征工程与数据准备
+# ------------------------------
+
+COLUMN_MAP = {
+    "孕妇代码": "subject_id",
+    "年龄": "age",
+    "身高": "height",
+    "体重": "weight",
+    "IVF妊娠": "ivf",
+    "检测孕周": "ga_weeks_str",
+    "检测孕周_数值": "ga_weeks",
+    "孕妇BMI": "bmi",
+    "原始读段数": "raw_reads",
+    "在参考基因组上比对的比例": "map_ratio",
+    "重复读段的比例": "dup_ratio",
+    "唯一比对的读段数": "uniq_mapped",
+    "GC含量": "gc",
+    "13号染色体的Z值": "z13",
+    "18号染色体的Z值": "z18",
+    "21号染色体的Z值": "z21",
+    "X染色体的Z值": "zx",
+    "Y染色体的Z值": "zy",
+    "Y染色体浓度": "y_fraction",
+    "X染色体浓度": "x_fraction",
+    "13号染色体的GC含量": "gc13",
+    "18号染色体的GC含量": "gc18",
+    "21号染色体的GC含量": "gc21",
+    "被过滤掉读段数的比例": "filtered_ratio",
+    "染色体的非整倍体": "aneuploidy",
+    "怀孕次数": "gravidity",
+    "生产次数": "parity",
+    "胎儿是否健康": "fetal_health",
+}
+
+
+def to_float(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def normalize_ivf(x) -> float:
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip().lower()
+    truthy = {"1", "是", "yes", "y", "true", "t"}
+    falsy = {"0", "否", "no", "n", "false", "f"}
+    if s in truthy:
+        return 1.0
+    if s in falsy:
+        return 0.0
+    # 其他情况尝试数字
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def assign_bmi_group(bmi: float, method: str = "clinical", quantiles: Optional[List[float]] = None) -> str:
+    if pd.isna(bmi):
+        return np.nan
+    
+    # 新的BMI分组逻辑和对应的建议检测时间
+    bmi_time_mapping = {
+        "BMI<18.5": None,  # 无法估计(无样本)
+        "BMI18.5-24": 16.29,
+        "BMI24-26": None,  # 无法估计(无样本)
+        "BMI26-28": 13.00,
+        "BMI28-30": 16.14,
+        "BMI30-32": 15.86,
+        "BMI32-34": 15.14,
+        "BMI34-36": 17.00,
+        "BMI≥36": 23.43
+    }
+    
+    # BMI分组逻辑
+    if bmi < 18.5:
+        return "BMI<18.5"
+    elif 18.5 <= bmi < 24:
+        return "BMI18.5-24"
+    elif 24 <= bmi < 26:
+        return "BMI24-26"
+    elif 26 <= bmi < 28:
+        return "BMI26-28"
+    elif 28 <= bmi < 30:
+        return "BMI28-30"
+    elif 30 <= bmi < 32:
+        return "BMI30-32"
+    elif 32 <= bmi < 34:
+        return "BMI32-34"
+    elif 34 <= bmi < 36:
+        return "BMI34-36"
+    else:
+        return "BMI≥36"
+
+
+def prepare_dataset(
+    df_raw: pd.DataFrame,
+    bmi_group_method: str = "clinical",
+    random_state: int = 42
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, float]:
+    df = df_raw.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df_raw.columns}).copy()
+
+    # 强制存在的关键列
+    required = ["subject_id", "bmi", "y_fraction", "ga_weeks"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺失必要列: {missing}")
+
+    # 类型转换
+    for c in ["age", "height", "weight", "ga_weeks", "bmi", "y_fraction", "gravidity", "parity", "zy", "zx"]:
+        if c in df.columns:
+            df[c] = to_float(df[c])
+    if "ivf" in df.columns:
+        df["ivf"] = df["ivf"].apply(normalize_ivf)
+
+    # 阈值与标签
+    thr = infer_threshold(df["y_fraction"], base_percent=4.0)
+    df["success"] = (df["y_fraction"] >= thr).astype(int)
+
+    # BMI分组
+    if bmi_group_method == "quantile":
+        qs = df["bmi"].quantile([0.2, 0.4, 0.6, 0.8]).tolist()
+        df["bmi_group"] = df["bmi"].apply(lambda x: assign_bmi_group(x, method="quantile", quantiles=qs))
+    else:
+        df["bmi_group"] = df["bmi"].apply(lambda x: assign_bmi_group(x, method="clinical"))
+
+    # 仅使用“预检可得”的特征：ga_weeks, bmi, age, ivf, gravidity, parity
+    candidate_features = [
+        c for c in ["ga_weeks", "bmi", "age", "ivf", "gravidity", "parity"] if c in df.columns
+    ]
+
+    # 去除缺失关键值
+    df = df.dropna(subset=["ga_weeks", "bmi"])  # t和BMI必须存在
+
+    X = df[candidate_features].copy()
+    y = df["success"].astype(int).copy()
+
+    return X, y, df[["subject_id", "bmi", "bmi_group", "ga_weeks", "success", "y_fraction", "zy"]].copy(), thr
+
+
+# ------------------------------
+# 不平衡处理与模型训练
+# ------------------------------
+
+def build_models(use_smote: bool = True, random_state: int = 42) -> Dict[str, Pipeline]:
+    numeric_features = None  # 将在外层根据X的列名构建
+
+    def make_preprocessor(feature_names: List[str]) -> ColumnTransformer:
+        nonlocal numeric_features
+        numeric_features = feature_names
+        numeric_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ])
+        return ColumnTransformer(
+            transformers=[
+                ("num", numeric_transformer, numeric_features),
+            ]
+        )
+
+    # 尝试导入SMOTE
+    smote_available = False
+    if use_smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            from imblearn.pipeline import Pipeline as ImbPipeline
+            smote_available = True
+        except Exception:
+            smote_available = False
+
+    def make_pipeline_logreg(features: List[str]):
+        preproc = make_preprocessor(features)
+        base = LogisticRegression(
+            class_weight="balanced",
+            max_iter=2000,
+            solver="liblinear",
+            random_state=random_state,
+        )
+        if smote_available:
+            return ImbPipeline(steps=[
+                ("preprocess", preproc),
+                ("smote", SMOTE(random_state=random_state)),
+                ("clf", base),
+            ])
+        return Pipeline(steps=[("preprocess", preproc), ("clf", base)])
+
+    def make_pipeline_rf(features: List[str]):
+        preproc = make_preprocessor(features)
+        base = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=None,
+            n_jobs=-1,
+            random_state=random_state,
+            class_weight="balanced_subsample",
+        )
+        if smote_available:
+            return ImbPipeline(steps=[
+                ("preprocess", preproc),
+                ("smote", SMOTE(random_state=random_state)),
+                ("clf", base),
+            ])
+        return Pipeline(steps=[("preprocess", preproc), ("clf", base)])
+
+    return {
+        "LogisticRegression": make_pipeline_logreg,
+        "RandomForest": make_pipeline_rf,
+    }
+
+
+def evaluate_models(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_builders: Dict[str, callable],
+    test_size: float = 0.2,
+    random_state: int = 42,
+    z_threshold: float = 3.0,
+    outputs_dir: str = "outputs"  
+) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, Pipeline], Tuple[np.ndarray, np.ndarray]]:
+    ensure_dir(outputs_dir)
+
+    # 仅在标签有两个类别时进行训练
+    if len(np.unique(y)) < 2:
+        raise ValueError("标签只有一个类别，无法训练分类模型。请检查数据中的成功/失败分布。")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, stratify=y, random_state=random_state
+    )
+
+    feature_names = X.columns.tolist()
+
+    metrics_summary: Dict[str, Dict[str, float]] = {}
+    best_model_name: Optional[str] = None
+    best_model: Optional[Pipeline] = None
+    best_score = -np.inf
+
+    # 训练并评估多个模型
+    for name, builder in model_builders.items():
+        model = builder(feature_names)
+        model.fit(X_train, y_train)
+        proba = model.predict_proba(X_test)[:, 1]
+        preds = (proba >= 0.5).astype(int)
+
+        auc_roc = roc_auc_score(y_test, proba)
+        auc_pr = average_precision_score(y_test, proba)
+        cm = confusion_matrix(y_test, preds)
+        report = classification_report(y_test, preds, output_dict=True, zero_division=0)
+
+        metrics_summary[name] = {
+            "AUC_ROC": float(auc_roc),
+            "AUC_PR": float(auc_pr),
+            "Precision": float(report["1"]["precision"]) if "1" in report else 0.0,
+            "Recall": float(report["1"]["recall"]) if "1" in report else 0.0,
+            "F1": float(report["1"]["f1-score"]) if "1" in report else 0.0,
+            "Support_Pos": int(report["1"]["support"]) if "1" in report else int(np.sum(y_test == 1)),
+        }
+
+        # 可视化：ROC & PR & 混淆矩阵
+        fpr, tpr, _ = roc_curve(y_test, proba)
+        prec, rec, _ = precision_recall_curve(y_test, proba)
+
+        plt.figure(figsize=(5.5, 4.5))
+        plt.plot(fpr, tpr, label=f"{name} AUC={auc_roc:.3f}")
+        plt.plot([0, 1], [0, 1], "--", color="gray")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC - {name}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(outputs_dir, f"roc_{name}.png"), dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(5.5, 4.5))
+        plt.plot(rec, prec, label=f"{name} AP={auc_pr:.3f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"PR - {name}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(outputs_dir, f"pr_{name}.png"), dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(4.6, 4.6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+        plt.title(f"Confusion Matrix - {name}")
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outputs_dir, f"cm_{name}.png"), dpi=180)
+        plt.close()
+
+        # 选择最优模型（以AUC-PR为主）
+        score = auc_pr
+        if score > best_score:
+            best_score = score
+            best_model_name = name
+            best_model = model
+
+    # 基线方法：仅用Y染色体Z值阈值
+    baseline_metrics = {}
+    if "zy" in X.columns:
+        zy_test = X_test["zy"].values
+        preds_base = (zy_test >= z_threshold).astype(int)
+        # 基线不具备概率，使用0/1代替概率评估AUC会无意义，这里使用报告与混淆矩阵
+        cm = confusion_matrix(y_test, preds_base)
+        report = classification_report(y_test, preds_base, output_dict=True, zero_division=0)
+        # 为了可比性，计算伪概率AUC：将预测映射为{0->0.0,1->1.0}
+        proba_base = preds_base.astype(float)
+        try:
+            auc_roc = roc_auc_score(y_test, proba_base)
+            auc_pr = average_precision_score(y_test, proba_base)
+        except Exception:
+            auc_roc, auc_pr = np.nan, np.nan
+        baseline_metrics = {
+            "AUC_ROC": float(auc_roc) if not np.isnan(auc_roc) else np.nan,
+            "AUC_PR": float(auc_pr) if not np.isnan(auc_pr) else np.nan,
+            "Precision": float(report.get("1", {}).get("precision", 0.0)),
+            "Recall": float(report.get("1", {}).get("recall", 0.0)),
+            "F1": float(report.get("1", {}).get("f1-score", 0.0)),
+            "Support_Pos": int(report.get("1", {}).get("support", int(np.sum(y_test == 1)))),
+        }
+        metrics_summary["Baseline_ZY"] = baseline_metrics
+
+        plt.figure(figsize=(4.6, 4.6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Greens")
+        plt.title(f"Confusion Matrix - Baseline ZY>= {z_threshold}")
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outputs_dir, f"cm_baseline_zy.png"), dpi=180)
+        plt.close()
+
+    # 保存指标
+    metrics_rows = []
+    for mname, vals in metrics_summary.items():
+        row = {"Model": mname}
+        row.update(vals)
+        metrics_rows.append(row)
+    pd.DataFrame(metrics_rows).to_csv(
+        os.path.join(outputs_dir, "model_metrics.csv"), index=False, encoding="utf-8-sig"
+    )
+
+    assert best_model_name is not None and best_model is not None
+    return metrics_summary, (best_model_name, best_model), (y_test.values, X_test.values)
+
+
+# ------------------------------
+# 风险函数与优化
+# ------------------------------
+
+def risk_piecewise(t: float, breaks: Tuple[float, float], values: Tuple[float, float, float]) -> float:
+    b1, b2 = breaks
+    v1, v2, v3 = values
+    if t <= b1:
+        return v1
+    elif t <= b2:
+        return v2
+    return v3
+
+
+def optimize_t_for_groups(
+    best_model: Pipeline,
+    feature_names: List[str], 
+    df_info: pd.DataFrame,
+    bmi_group_col: str,
+    t_grid: np.ndarray,
+    risk_breaks: Tuple[float, float],
+    risk_values: Tuple[float, float, float],
+    r_fail: float,
+    outputs_dir: str = "outputs"
+) -> pd.DataFrame:
+    ensure_dir(outputs_dir)
+    
+    # 为不可变特征设置代表性值（中位数/众数）
+    representatives: Dict[str, float] = {}
+    for col in feature_names:
+        if col == "ga_weeks" or col == "bmi":
+            continue
+        if col in df_info.columns:
+            # 分类/二值按众数，连续按中位数
+            col_series = df_info[col]
+            if col_series.dtype.kind in {"i", "u", "f"}:
+                representatives[col] = float(np.nanmedian(col_series.values))
+            else:
+                representatives[col] = float(pd.to_numeric(col_series, errors="coerce").median())
+        else:
+            representatives[col] = 0.0
+
+    groups = [g for g in df_info[bmi_group_col].dropna().unique().tolist()]
+    groups_sorted = sorted(groups)
+
+    results = []
+
+    # 风险曲线图
+    plt.figure(figsize=(6.5, 4.6))
+
+    for group in groups_sorted:
+        group_df = df_info[df_info[bmi_group_col] == group]
+        if group_df.empty:
+            continue
+        bmi_med = float(np.nanmedian(group_df["bmi"].values))
+
+        grid_rows = []
+        for t in t_grid:
+            row = {}
+            for col in feature_names:
+                if col == "ga_weeks":
+                    row[col] = float(t)
+                elif col == "bmi":
+                    row[col] = float(bmi_med)
+                else:
+                    row[col] = representatives.get(col, 0.0)
+            grid_rows.append(row)
+        grid_df = pd.DataFrame(grid_rows)[feature_names]
+
+        probs = best_model.predict_proba(grid_df)[:, 1]
+        risks_Rt = np.array([risk_piecewise(float(t), risk_breaks, risk_values) for t in t_grid])
+        expected_risk = risks_Rt * probs + r_fail * (1.0 - probs)
+
+        idx_star = int(np.argmin(expected_risk))
+        t_star = float(t_grid[idx_star])
+        p_star = float(probs[idx_star])
+        e_star = float(expected_risk[idx_star])
+
+        # 保存每组曲线
+        curve_df = pd.DataFrame({
+            "t_weeks": t_grid,
+            "P_success": probs,
+            "R_t": risks_Rt,
+            "E_expected": expected_risk,
+        })
+
+        # Sanitize group name for file path
+        safe_group = sanitize_filename(str(group))
+        
+        curve_df.to_csv(
+            os.path.join(outputs_dir, f"risk_curve_{safe_group}.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        # 绘图
+        plt.plot(t_grid, expected_risk, label=f"{group} | t*={t_star:.2f}")
+        plt.scatter([t_star], [e_star], s=30)
+
+        results.append({
+            "BMI_Group": group,
+            "BMI_Median": bmi_med,
+            "t_star_weeks": t_star,
+            "P_success_at_t_star": p_star,
+            "E_expected_at_t_star": e_star,
+        })
+
+    plt.xlabel("孕周 t (周)")
+    plt.ylabel("期望风险 E(t)")
+    plt.title("各BMI分组的期望风险曲线与最优时点")
+    if results:
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(outputs_dir, "risk_curves.png"), dpi=200)
+    plt.close()
+
+    res_df = pd.DataFrame(results)
+    res_df.to_csv(os.path.join(outputs_dir, "optimal_t_by_bmi_group.csv"), index=False, encoding="utf-8-sig")
+    return res_df
+
+
+# ------------------------------
+# 主流程
+# ------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="NIPT 风险最小化与优化建模（男胎数据）")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=os.path.join(base_dir, "cleaned_data最终(1).csv"),
+        help="输入数据CSV路径。默认与脚本同目录的 cleaned_data最终(1).csv",
+    )
+    parser.add_argument(
+        "--outputs",
+        type=str,
+        default=os.path.join(base_dir, "outputs"),
+        help="输出目录",
+    )
+    parser.add_argument(
+        "--bmi_group_method",
+        type=str,
+        choices=["clinical", "quantile"],
+        default="clinical",
+        help="BMI分组方法：clinical 临床分组；quantile 分位数分组",
+    )
+    parser.add_argument(
+        "--use_smote",
+        action="store_true",
+        help="训练时使用SMOTE过采样（需安装 imblearn）",
+    )
+    parser.add_argument(
+        "--z_threshold",
+        type=float,
+        default=3.0,
+        help="基线方法：Y染色体Z值阈值",
+    )
+    parser.add_argument(
+        "--t_min",
+        type=float,
+        default=10.0,
+        help="优化网格下限（孕周）",
+    )
+    parser.add_argument(
+        "--t_max",
+        type=float,
+        default=24.0,
+        help="优化网格上限（孕周）",
+    )
+    parser.add_argument(
+        "--t_step",
+        type=float,
+        default=0.1,
+        help="优化网格步长（孕周）",
+    )
+    parser.add_argument(
+        "--risk_break1",
+        type=float,
+        default=12.0,
+        help="风险分段第一阈值（<=break1为低风险）",
+    )
+    parser.add_argument(
+        "--risk_break2",
+        type=float,
+        default=14.0,
+        help="风险分段第二阈值（(break1, break2]为中风险，>break2为高风险）",
+    )
+    parser.add_argument(
+        "--risk_v1",
+        type=float,
+        default=1.0,
+        help="低风险段 R1",
+    )
+    parser.add_argument(
+        "--risk_v2",
+        type=float,
+        default=2.0,
+        help="中风险段 R2",
+    )
+    parser.add_argument(
+        "--risk_v3",
+        type=float,
+        default=4.0,
+        help="高风险段 R3",
+    )
+    parser.add_argument(
+        "--r_fail",
+        type=float,
+        default=6.0,
+        help="检测失败（需等待重测）导致的高风险 R_fail",
+    )
+
+    args = parser.parse_args()
+
+    ensure_dir(args.outputs)
+
+    # 读取数据
+    df_raw = read_csv_robust(args.csv)
+
+    # 准备数据
+    X, y, df_info, thr = prepare_dataset(df_raw, bmi_group_method=args.bmi_group_method)
+
+    # 保存训练用基础信息
+    df_info.to_csv(os.path.join(args.outputs, "prepared_info.csv"), index=False, encoding="utf-8-sig")
+
+    # 训练与评估
+    model_builders = build_models(use_smote=args.use_smote)
+    metrics_summary, (best_name, best_model), (y_test, X_test_np) = evaluate_models(
+        X=X,
+        y=y,
+        model_builders=model_builders,
+        test_size=0.2,
+        random_state=42,
+        z_threshold=args.z_threshold,
+        outputs_dir=args.outputs,
+    )
+
+    print("模型评估指标（详见 outputs/model_metrics.csv）:")
+    for k, v in metrics_summary.items():
+        print(f"- {k}: AUC-PR={v.get('AUC_PR', np.nan):.4f}, AUC-ROC={v.get('AUC_ROC', np.nan):.4f}, F1={v.get('F1', np.nan):.4f}")
+    print(f"选择最优模型用于优化: {best_name}")
+
+    # 基于风险函数进行优化
+    t_grid = np.arange(args.t_min, args.t_max + 1e-9, args.t_step)
+    feature_names = X.columns.tolist()
+    opt_df = optimize_t_for_groups(
+        best_model=best_model,
+        feature_names=feature_names,
+        df_info=pd.concat([X, df_info.drop(columns=[c for c in X.columns if c in df_info.columns], errors='ignore')], axis=1),
+        bmi_group_col="bmi_group",
+        t_grid=t_grid,
+        risk_breaks=(args.risk_break1, args.risk_break2),
+        risk_values=(args.risk_v1, args.risk_v2, args.risk_v3),
+        r_fail=args.r_fail,
+        outputs_dir=args.outputs,
+    )
+
+    print("各BMI分组最优检测时点（见 outputs/optimal_t_by_bmi_group.csv）：")
+    for _, row in opt_df.iterrows():
+        print(f"  组别={row['BMI_Group']}: t*={row['t_star_weeks']:.2f}周, 预期风险={row['E_expected_at_t_star']:.3f}, 成功概率={row['P_success_at_t_star']:.3f}")
+
+    # 保存阈值信息
+    with open(os.path.join(args.outputs, "notes.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Y染色体浓度达标阈值: {thr}\n")
+        f.write(f"风险分段: <= {args.risk_break1} -> {args.risk_v1}; ({args.risk_break1}, {args.risk_break2}] -> {args.risk_v2}; > {args.risk_break2} -> {args.risk_v3}\n")
+        f.write(f"检测失败风险 R_fail: {args.r_fail}\n")
+        f.write(f"最优模型: {best_name}\n")
+
+
+if __name__ == "__main__":
+    main()
+
+
