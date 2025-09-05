@@ -3,6 +3,7 @@ import numpy as np
 from lifelines import KaplanMeierFitter
 import matplotlib.pyplot as plt
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 # 读取CSV（编码容错）并规范字段
@@ -17,7 +18,9 @@ def read_csv_robust(path):
             continue
     raise last_err
 
-df_raw = read_csv_robust('cleaned_data最终(1).csv')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, 'cleaned_data最终(1).csv')
+df_raw = read_csv_robust(CSV_PATH)
 
 # 规范列名
 col_map = {
@@ -42,16 +45,18 @@ df = df.dropna(subset=['bmi', 'y_fraction', 'ga_weeks'])
 def assign_bmi_group(bmi):
     if pd.isna(bmi):
         return np.nan
-    if bmi < 18.5:
-        return '<18.5'
-    elif 18.5 <= bmi < 24:
-        return '18.5-24'
-    elif 24 <= bmi < 28:
-        return '24-28'
-    elif 28 <= bmi < 32:
-        return '28-32'
+    if 20.70 <= bmi < 29.95:
+        return 'Q1(20.70~29.95)'
+    elif 29.95 <= bmi < 31.05:
+        return 'Q2(29.95~31.05)'
+    elif 31.05 <= bmi < 32.52:
+        return 'Q3(31.05~32.52)'
+    elif 32.52 <= bmi < 34.20:
+        return 'Q4(32.52~34.20)'
+    elif 34.20 <= bmi <= 45.71:
+        return 'Q5(34.20~45.71)'
     else:
-        return '>=32'
+        return np.nan
 
 df['bmi_group'] = df['bmi'].apply(assign_bmi_group)
 
@@ -91,7 +96,7 @@ survival_df = pd.DataFrame(records)
 survival_df = survival_df.dropna(subset=['bmi_group'])
 
 # 计算每个BMI组的95%分位达标孕周（F(t)≥0.95 -> S(t)≤0.05）
-bmi_groups = ['<18.5', '18.5-24', '24-28', '28-32', '>=32']
+bmi_groups = ['Q1(20.70~29.95)', 'Q2(29.95~31.05)', 'Q3(31.05~32.52)', 'Q4(32.52~34.20)', 'Q5(34.20~45.71)']
 best_times = {}
 
 # 动态绘图布局
@@ -133,7 +138,7 @@ for j in range(start_idx, len(axes)):
     axes[j].set_visible(False)
 
 plt.tight_layout()
-plt.savefig('survival_curves.png', dpi=200)
+plt.savefig(os.path.join(BASE_DIR, 'survival_curves.png'), dpi=200)
 try:
     plt.show()
 except Exception:
@@ -153,8 +158,8 @@ for group in bmi_groups:
     t = best_times.get(group, np.nan)
     result_rows.append({'BMI_Group': group, 'Best_NIPT_Time_Weeks': t})
 result_df = pd.DataFrame(result_rows)
-result_df.to_csv('best_nipt_times.csv', index=False, encoding='utf-8-sig')
+result_df.to_csv(os.path.join(BASE_DIR, 'best_nipt_times.csv'), index=False, encoding='utf-8-sig')
 
 # 保存个体级别达标时间数据
-survival_df.to_csv('subject_time_to_threshold.csv', index=False, encoding='utf-8-sig')
-print('结果已保存到 best_nipt_times.csv 与 subject_time_to_threshold.csv；曲线图保存为 survival_curves.png')
+survival_df.to_csv(os.path.join(BASE_DIR, 'subject_time_to_threshold.csv'), index=False, encoding='utf-8-sig')
+print('结果已保存到脚本目录：best_nipt_times.csv、subject_time_to_threshold.csv；曲线图：survival_curves.png')
