@@ -1,0 +1,380 @@
+import pandas as pd
+import numpy as np
+from lifelines import KaplanMeierFitter
+import matplotlib.pyplot as plt
+import warnings
+import os
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+
+# --------------------------
+# BMI分组标准（临床常用9组）
+# --------------------------
+def assign_bmi_group(bmi):
+    if pd.isna(bmi):
+        return np.nan
+    if bmi < 18.5:
+        return 'BMI组 <18.5'  # 低体重
+    elif 18.5 <= bmi < 24:
+        return 'BMI组 18.5-24'  # 正常体重
+    elif 24 <= bmi < 26:
+        return 'BMI组 24-26'  # 超重前期
+    elif 26 <= bmi < 28:
+        return 'BMI组 26-28'  # 轻度超重
+    elif 28 <= bmi < 30:
+        return 'BMI组 28-30'  # 肥胖前期
+    elif 30 <= bmi < 32:
+        return 'BMI组 30-32'  # 轻度肥胖
+    elif 32 <= bmi < 34:
+        return 'BMI组 32-34'  # 中度肥胖
+    elif 34 <= bmi < 36:
+        return 'BMI组 34-36'  # 重度肥胖1
+    elif bmi >= 36:
+        return 'BMI组 ≥36'  # 重度肥胖2
+    else:
+        return np.nan
+
+
+# --------------------------
+# 数据读取与预处理
+# --------------------------
+def read_csv_robust(path):
+    encodings = ['utf-8-sig', 'gb18030', 'gbk', 'utf-8']
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, 'cleaned_data最终.csv')
+df_raw = read_csv_robust(CSV_PATH)
+
+# 规范列名
+col_map = {
+    '孕妇代码': 'subject_id',
+    '孕妇BMI': 'bmi',
+    'Y染色体浓度': 'y_fraction',
+    '检测孕周_数值': 'ga_weeks'
+}
+missing_cols = [c for c in col_map.keys() if c not in df_raw.columns]
+if missing_cols:
+    raise ValueError(f'缺失必要列: {missing_cols}')
+
+df = df_raw.rename(columns=col_map).copy()
+
+# 转换数据类型并清洗
+for c in ['bmi', 'y_fraction', 'ga_weeks']:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+df = df[~df['subject_id'].isna()]
+df = df.dropna(subset=['bmi', 'y_fraction', 'ga_weeks'])
+
+# 应用BMI分组
+df['bmi_group'] = df['bmi'].apply(assign_bmi_group)
+
+
+# --------------------------
+# 核心参数与函数定义
+# --------------------------
+def infer_threshold(series, base_percent=4.0):
+    s = series.dropna()
+    if s.empty:
+        return base_percent / 100.0
+    if s.median() > 1.0 or s.quantile(0.9) > 1.0:
+        return base_percent
+    return base_percent / 100.0
+
+
+threshold = infer_threshold(df['y_fraction'], base_percent=4.0)
+TARGET_SURVIVAL = 0.10  # 90%达标率
+
+
+def subject_time_to_threshold(group_df, thr):
+    g = group_df.sort_values('ga_weeks')
+    reached = g[g['y_fraction'] >= thr]
+    if not reached.empty:
+        return pd.Series({'time': float(reached['ga_weeks'].iloc[0]), 'event': 1})
+    return pd.Series({'time': float(g['ga_weeks'].max()), 'event': 0})
+
+
+# 构建基础生存分析数据集
+records = []
+for sid, g in df.groupby('subject_id', sort=False):
+    res = subject_time_to_threshold(g, threshold)
+    records.append({
+        'patient_id': sid,
+        'bmi': float(g['bmi'].iloc[0]),
+        'bmi_group': g['bmi_group'].iloc[0],
+        'time': float(res['time']),
+        'event': int(res['event'])
+    })
+
+survival_df = pd.DataFrame(records)
+survival_df = survival_df.dropna(subset=['bmi_group'])
+
+# BMI分组列表
+bmi_groups = [
+    'BMI组 <18.5', 'BMI组 18.5-24', 'BMI组 24-26',
+    'BMI组 26-28', 'BMI组 28-30', 'BMI组 30-32',
+    'BMI组 32-34', 'BMI组 34-36', 'BMI组 ≥36'
+]
+
+
+# --------------------------
+# 基准最佳时点计算
+# --------------------------
+def calculate_best_times(survival_data, groups, target_survival):
+    best_times = {}
+    for group in groups:
+        gd = survival_data[survival_data['bmi_group'] == group]
+        if gd.empty:
+            best_times[group] = np.nan
+            continue
+
+        kmf = KaplanMeierFitter()
+        kmf.fit(durations=gd['time'], event_observed=gd['event'], label=group)
+        sf_df = kmf.survival_function_
+        sf = sf_df.iloc[:, 0]
+        leq = sf[sf <= target_survival]
+        best_time = float(leq.index.min()) if not leq.empty else np.nan
+        best_times[group] = best_time
+    return best_times
+
+
+best_times_base = calculate_best_times(survival_df, bmi_groups, TARGET_SURVIVAL)
+
+
+# --------------------------
+# 核心扩展：不同置信度的误差模拟
+# 增加误差置信水平参数（confidence_level），生成对应置信度的误差范围
+# --------------------------
+def add_bmi_measurement_error_with_confidence(bmi_series, error_pct, confidence_level=0.95):
+    """
+    模拟不同置信度下的BMI测量误差
+    confidence_level: 误差置信水平（0.68, 0.90, 0.95, 0.99）对应不同的标准差倍数
+    """
+    np.random.seed(42)
+    # 根据置信水平获取正态分布的分位数（双侧）
+    z_score = stats.norm.ppf((1 + confidence_level) / 2)
+    # 误差幅度 = 基础误差百分比 × z分数（确保在指定置信度下的误差范围）
+    scaled_error_pct = error_pct * z_score
+
+    error = bmi_series * scaled_error_pct * np.random.normal(loc=0, scale=1, size=len(bmi_series))
+    # 截断误差至理论置信区间
+    max_error = bmi_series * error_pct * z_score
+    error = np.clip(error, -max_error, max_error)
+    return bmi_series + error
+
+
+def add_yfraction_detection_error_with_confidence(yfraction_series, error_pct, confidence_level=0.95):
+    """模拟不同置信度下的Y染色体浓度检测误差"""
+    np.random.seed(42)
+    z_score = stats.norm.ppf((1 + confidence_level) / 2)
+    scaled_error_pct = error_pct * z_score
+
+    error = yfraction_series * scaled_error_pct * np.random.normal(loc=0, scale=1, size=len(yfraction_series))
+    max_error = yfraction_series * error_pct * z_score
+    error = np.clip(error, -max_error, max_error)
+    return np.maximum(yfraction_series + error, 0)  # 确保浓度非负
+
+
+def recalculate_with_error_confidence(df_original, error_type, error_pct, confidence_level, threshold):
+    """重新计算特定误差类型、幅度和置信度下的最佳时点"""
+    df_error = df_original.copy()
+
+    # 加入特定置信度的误差
+    if error_type == 'bmi':
+        df_error['bmi'] = add_bmi_measurement_error_with_confidence(
+            df_error['bmi'], error_pct, confidence_level)
+        df_error['bmi_group'] = df_error['bmi'].apply(assign_bmi_group)
+    elif error_type == 'yfraction':
+        df_error['y_fraction'] = add_yfraction_detection_error_with_confidence(
+            df_error['y_fraction'], error_pct, confidence_level)
+
+    # 重新计算个体达标时间
+    records_error = []
+    for sid, g in df_error.groupby('subject_id', sort=False):
+        if pd.isna(g['bmi_group'].iloc[0]):
+            continue
+        res = subject_time_to_threshold(g, threshold)
+        records_error.append({
+            'patient_id': sid,
+            'bmi': float(g['bmi'].iloc[0]),
+            'bmi_group': g['bmi_group'].iloc[0],
+            'time': float(res['time']),
+            'event': int(res['event'])
+        })
+
+    # 计算最佳时点
+    survival_df_error = pd.DataFrame(records_error)
+    survival_df_error = survival_df_error.dropna(subset=['bmi_group'])
+    return calculate_best_times(survival_df_error, bmi_groups, TARGET_SURVIVAL)
+
+
+# --------------------------
+# 实验设计：多维度误差场景（类型×幅度×置信度）
+# --------------------------
+# 定义要测试的误差置信水平（常用统计置信度）
+confidence_levels = [0.68, 0.90, 0.95, 0.99]  # 对应约1σ, 1.64σ, 1.96σ, 2.58σ
+# 误差类型与基础幅度
+error_types = [
+    {'type': 'bmi', 'base_pct': 0.03, 'name': 'BMI测量误差'},  # 基础误差±3%
+    {'type': 'bmi', 'base_pct': 0.05, 'name': 'BMI测量误差'},  # 基础误差±5%
+    {'type': 'yfraction', 'base_pct': 0.05, 'name': 'Y浓度误差'},  # 基础误差±5%
+    {'type': 'yfraction', 'base_pct': 0.10, 'name': 'Y浓度误差'}  # 基础误差±10%
+]
+
+# 存储所有场景结果
+results = {
+    '基准（无误差）': {
+        'confidence': 'N/A',
+        'best_times': best_times_base,
+        'error_type': '无误差',
+        'error_pct': 0
+    }
+}
+
+# 运行多维度误差实验
+print('=' * 80)
+print('【不同误差置信度影响分析】开始系统计算...')
+print(f'测试置信水平: {[f"{cl * 100}%" for cl in confidence_levels]}')
+print('=' * 80)
+
+for error_spec in error_types:
+    err_type = error_spec['type']
+    base_pct = error_spec['base_pct']
+    err_name = error_spec['name']
+    base_pct_str = f"±{base_pct * 100}%"
+
+    for cl in confidence_levels:
+        cl_pct = f"{cl * 100}%"
+        print(f'\n计算 {err_name} {base_pct_str} 在 {cl_pct} 置信度下的结果...')
+
+        # 计算该场景下的最佳时点
+        best_times = recalculate_with_error_confidence(
+            df, err_type, base_pct, cl, threshold)
+
+        # 存储结果
+        scenario_key = f"{err_name} {base_pct_str} ({cl_pct}置信)"
+        results[scenario_key] = {
+            'confidence': cl,
+            'best_times': best_times,
+            'error_type': err_type,
+            'error_pct': base_pct
+        }
+
+# --------------------------
+# 结果分析与可视化：误差置信度对时点偏差的影响
+# --------------------------
+# 1. 计算各场景下的时点偏差（与基准的差异）
+deviation_data = []
+for scenario, data in results.items():
+    if scenario == '基准（无误差）':
+        continue
+    for group in bmi_groups:
+        base_time = best_times_base.get(group, np.nan)
+        curr_time = data['best_times'].get(group, np.nan)
+        if not np.isnan(base_time) and not np.isnan(curr_time):
+            deviation = curr_time - base_time
+            deviation_data.append({
+                'scenario': scenario,
+                'error_type': data['error_type'],
+                'error_pct': data['error_pct'] * 100,  # 转为百分比
+                'confidence': data['confidence'] * 100,  # 转为百分比
+                'bmi_group': group,
+                'base_time': base_time,
+                'current_time': curr_time,
+                'deviation': deviation
+            })
+
+deviation_df = pd.DataFrame(deviation_data)
+
+# 2. 按误差类型和BMI组可视化置信度与偏差的关系
+plt.figure(figsize=(16, 10))
+error_types_unique = deviation_df['error_type'].unique()
+n_types = len(error_types_unique)
+
+for i, err_type in enumerate(error_types_unique, 1):
+    plt.subplot(n_types, 1, i)
+    type_data = deviation_df[deviation_df['error_type'] == err_type]
+    pcts = type_data['error_pct'].unique()
+
+    for pct in pcts:
+        pct_data = type_data[type_data['error_pct'] == pct]
+        # 按BMI组绘图
+        for group in pct_data['bmi_group'].unique():
+            group_data = pct_data[pct_data['bmi_group'] == group]
+            plt.plot(
+                group_data['confidence'],
+                group_data['deviation'],
+                marker='o',
+                label=f"{group} (误差{pct}%)"
+            )
+
+    plt.title(f'{err_type}：不同置信度下的最佳时点偏差（与基准对比）', fontsize=12)
+    plt.xlabel('误差置信度（%）')
+    plt.ylabel('时点偏差（周）')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+
+plt.tight_layout()
+plt.savefig(os.path.join(BASE_DIR, 'error_confidence_impact.png'), dpi=300, bbox_inches='tight')
+try:
+    plt.show()
+except Exception:
+    pass
+
+# 3. 量化误差置信度敏感度：偏差变化量 / 置信度变化量
+sensitivity_data = []
+for err_type in error_types_unique:
+    type_data = deviation_df[deviation_df['error_type'] == err_type]
+    pcts = type_data['error_pct'].unique()
+
+    for pct in pcts:
+        pct_data = type_data[type_data['error_pct'] == pct]
+        for group in pct_data['bmi_group'].unique():
+            group_data = pct_data[pct_data['bmi_group'] == group].sort_values('confidence')
+            if len(group_data) < 2:
+                continue
+
+            # 计算敏感度：偏差变化量 / 置信度变化量
+            delta_deviation = group_data['deviation'].iloc[-1] - group_data['deviation'].iloc[0]
+            delta_confidence = group_data['confidence'].iloc[-1] - group_data['confidence'].iloc[0]
+            if delta_confidence != 0:
+                sensitivity = delta_deviation / delta_confidence
+                sensitivity_data.append({
+                    'error_type': err_type,
+                    'error_pct': pct,
+                    'bmi_group': group,
+                    'confidence_sensitivity': sensitivity  # 每%置信度变化导致的时点偏差变化
+                })
+
+sensitivity_df = pd.DataFrame(sensitivity_data)
+print(f'\n' + '=' * 80)
+print('【误差置信度敏感度】每%置信度变化导致的时点偏差变化（周/%）：')
+print('=' * 80)
+print(sensitivity_df.pivot_table(
+    index=['bmi_group', 'error_type'],
+    columns='error_pct',
+    values='confidence_sensitivity',
+    aggfunc='mean'
+).round(4))
+
+# --------------------------
+# 结果保存
+# --------------------------
+# 保存偏差数据
+deviation_df.to_csv(os.path.join(BASE_DIR, 'error_confidence_deviations.csv'), index=False, encoding='utf-8-sig')
+# 保存敏感度数据
+sensitivity_df.to_csv(os.path.join(BASE_DIR, 'error_confidence_sensitivity.csv'), index=False, encoding='utf-8-sig')
+
+print(f'\n结果已保存至脚本目录：')
+print(f'1. 不同置信度下的时点偏差数据：error_confidence_deviations.csv')
+print(f'2. 误差置信度敏感度数据：error_confidence_sensitivity.csv')
+print(f'3. 置信度影响可视化图：error_confidence_impact.png')
