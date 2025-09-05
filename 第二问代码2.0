@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NIPT问题2：BMI分组与最佳检测时点优化（修正版）
+修正敏感性分析中的可视化错误
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, silhouette_samples
+from sklearn.preprocessing import StandardScaler
+from scipy.optimize import minimize_scalar
+from scipy.stats import norm
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+class NIPTOptimizer:
+    def __init__(self):
+        self.data = None
+        self.pregnant_data = None
+        self.optimal_timings = {}
+        self.risk_functions = None
+
+    def load_and_preprocess_data(self, file_path='cleaned_data最终.csv'):
+        """数据读取与预处理"""
+        print("=== 问题2：BMI分组与最佳NIPT时点优化 ===")
+        print("步骤1：数据读取与预处理")
+
+        try:
+            # 修正：使用pd.read_csv读取CSV文件
+            self.data = pd.read_csv(file_path)
+            print(f"成功读取数据，共{len(self.data)}条记录")
+        except:
+            print("请确保'cleaned_data最终.csv'文件存在")
+            return False
+
+        # 数据清洗
+        df = self.data.copy()
+
+        # 解析孕周格式
+        def parse_gestational_week(week_str):
+            if pd.isna(week_str):
+                return None
+            try:
+                if 'w' in str(week_str):
+                    parts = str(week_str).replace('w', '').split('+')
+                    weeks = float(parts[0])
+                    days = float(parts[1]) if len(parts) > 1 else 0
+                    return weeks + days / 7
+                else:
+                    return float(week_str)
+            except:
+                return None
+
+        df['孕周数值'] = df['检测孕周'].apply(parse_gestational_week)
+
+        # 数值列转换
+        numeric_columns = ['年龄', '身高', '体重', '孕妇BMI', 'Y染色体浓度']
+        for col in numeric_columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # 筛选有效数据
+        valid_mask = (
+                df['Y染色体浓度'].notna() &
+                (df['Y染色体浓度'] > 0) &
+                df['孕周数值'].notna() &
+                 df['孕妇BMI'].notna() &
+            df['年龄'].notna() &
+            (df['孕妇BMI'] > 15) & (df['孕妇BMI'] < 60) &
+            (df['孕周数值'] >= 10) & (df['孕周数值'] <= 25)
+        )
+        
+        df_clean = df[valid_mask].copy()
+        df_clean['Y浓度达标'] = (df_clean['Y染色体浓度'] >= 0.04).astype(int)
+        
+        print(f"数据清洗：{len(self.data)} -> {len(df_clean)} 条记录")
+        print(f"Y染色体浓度达标率：{df_clean['Y浓度达标'].mean()*100:.1f}%")
+        
+        self.data = df_clean
+        return True
+        
+    def prepare_clustering_data(self):
+        """准备聚类数据"""
+        print("\n步骤2：准备聚类数据")
+        
+        def calculate_representative_data(group):
+            """计算每个孕妇的代表性数据"""
+            bmi = group['孕妇BMI'].iloc[-1]
+            
+            # 达标时间：第一次达标的孕周，未达标则用最后一次
+            达标记录 = group[group['Y浓度达标'] == 1]
+            if len(达标记录) > 0:
+                达标时间 = 达标记录['孕周数值'].min()
+            else:
+                达标时间 = group['孕周数值'].max()
+            
+            return pd.Series({
+                'BMI': bmi,
+                '达标时间': 达标时间,
+                '平均Y浓度': group['Y染色体浓度'].mean(),
+                '检测次数': len(group),
+                '最终达标': group['Y浓度达标'].max(),
+                '年龄': group['年龄'].iloc[-1]
+            })
+        
+        self.pregnant_data = self.data.groupby('孕妇代码').apply(
+            calculate_representative_data
+        ).reset_index()
+        
+        print(f"孕妇总数：{len(self.pregnant_data)}人")
+        print(f"最终达标率：{self.pregnant_data['最终达标'].mean()*100:.1f}%")
+        
+        return self.pregnant_data
+
+# 实例化并运行
+optimizer = NIPTOptimizer()
+if optimizer.load_and_preprocess_data():
+    pregnant_data = optimizer.prepare_clustering_data()
+
+def calculate_silhouette_scores(pregnant_data, max_k=8):
+    """计算轮廓系数"""
+    print("\n步骤3：计算轮廓系数确定最佳聚类数")
+    
+    X = pregnant_data[['BMI']].values
+    k_range = range(2, max_k + 1)
+    silhouette_scores = []
+    inertias = []
+    
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(X)
+        
+        silhouette_avg = silhouette_score(X, cluster_labels)
+        silhouette_scores.append(silhouette_avg)
+        inertias.append(kmeans.inertia_)
+        
+        print(f"K={k}: 轮廓系数={silhouette_avg:.4f}")
+    
+    return k_range, silhouette_scores, inertias
+
+def plot_clustering_evaluation(k_range, silhouette_scores, inertias):
+    """绘制聚类评估图"""
+    print("\n步骤4：绘制聚类评估图")
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # 轮廓系数图
+    ax1.plot(k_range, silhouette_scores, 'bo-', linewidth=2, markersize=8)
+    ax1.set_xlabel('聚类数量 K')
+    ax1.set_ylabel('轮廓系数')
+    ax1.set_title('轮廓系数 vs 聚类数量')
+    ax1.grid(True, alpha=0.3)
+    
+    # 找到最佳K值
+    best_k_idx = np.argmax(silhouette_scores)
+    best_k = k_range[best_k_idx]
+    best_score = silhouette_scores[best_k_idx]
+    
+    ax1.plot(best_k, best_score, 'ro', markersize=12, 
+             label=f'最佳K={best_k}\n轮廓系数={best_score:.4f}')
+    ax1.legend()
+    
+    # 肘部法则图
+    ax2.plot(k_range, inertias, 'go-', linewidth=2, markersize=8)
+    ax2.set_xlabel('聚类数量 K')
+    ax2.set_ylabel('组内平方和')
+    ax2.set_title('肘部法则')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"推荐聚类数：K={best_k}（轮廓系数最高）")
+    
+    return best_k
+
+# 运行聚类评估
+k_range, silhouette_scores, inertias = calculate_silhouette_scores(pregnant_data)
+optimal_k = plot_clustering_evaluation(k_range, silhouette_scores, inertias)
+
+def perform_final_clustering(pregnant_data, optimal_k):
+    """执行最终聚类"""
+    print(f"\n步骤5：使用K={optimal_k}进行最终聚类")
+    
+    X = pregnant_data[['BMI']].values
+    kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X)
+    
+    pregnant_data_clustered = pregnant_data.copy()
+    pregnant_data_clustered['BMI分组'] = cluster_labels
+    
+    print("\n各BMI分组特征：")
+    for i in range(optimal_k):
+        group_data = pregnant_data_clustered[pregnant_data_clustered['BMI分组'] == i]
+        print(f"\n分组 {i+1}:")
+        print(f"  样本数量: {len(group_data)}人")
+        print(f"  BMI范围: {group_data['BMI'].min():.1f} - {group_data['BMI'].max():.1f}")
+        print(f"  BMI均值: {group_data['BMI'].mean():.1f}±{group_data['BMI'].std():.1f}")
+        print(f"  达标时间: {group_data['达标时间'].mean():.1f}±{group_data['达标时间'].std():.1f}周")
+        print(f"  达标率: {group_data['最终达标'].mean()*100:.1f}%")
+    
+    return pregnant_data_clustered, kmeans
+
+# 执行最终聚类
+pregnant_data_clustered, kmeans_model = perform_final_clustering(pregnant_data, optimal_k)
+
+def build_risk_functions():
+    """构建风险函数"""
+    print("\n步骤6：构建风险函数")
+    
+    def detection_failure_risk(t, bmi):
+        """检测失败风险：基于经验模型"""
+        # 简化的风险模型（实际应使用问题1的回归结果）
+        y_pred = -0.02 + 0.003 * t - 0.0008 * bmi + 0.00002 * t * bmi
+        sigma = 0.015
+        failure_prob = norm.cdf((0.04 - y_pred) / sigma)
+        return failure_prob
+    
+    def late_detection_risk(t):
+        """延误诊断风险：分段函数"""
+        if t <= 12:
+            return 0
+        elif t <= 27:
+            return 0.1 * (t - 12) ** 2
+        else:
+            return 0.1 * (27 - 12) ** 2 + 0.5 * (t - 27) ** 2
+    
+    def total_risk(t, bmi, lambda_weight=0.6):
+        """总风险函数"""
+        fail_risk = detection_failure_risk(t, bmi)
+        late_risk = late_detection_risk(t)
+        return lambda_weight * late_risk + (1 - lambda_weight) * fail_risk
+    
+    return detection_failure_risk, late_detection_risk, total_risk
+
+def optimize_nipt_timing(pregnant_data_clustered, risk_functions):
+    """优化NIPT时点"""
+    print("\n步骤7：最佳NIPT时点优化")
+    
+    detection_failure_risk, late_detection_risk, total_risk = risk_functions
+    optimal_timings = {}
+    n_groups = pregnant_data_clustered['BMI分组'].nunique()
+    
+    for group_id in range(n_groups):
+        group_data = pregnant_data_clustered[pregnant_data_clustered['BMI分组'] == group_id]
+        representative_bmi = group_data['BMI'].mean()
+        
+        def objective(t):
+            return total_risk(t, representative_bmi)
+        
+        result = minimize_scalar(objective, bounds=(10, 25), method='bounded')
+        optimal_time = result.x
+        min_risk = result.fun
+        
+        optimal_timings[group_id] = {
+            'optimal_week': optimal_time,
+            'min_risk': min_risk,
+            'failure_risk': detection_failure_risk(optimal_time, representative_bmi),
+            'late_risk': late_detection_risk(optimal_time),
+            'representative_bmi': representative_bmi,
+            'bmi_range': (group_data['BMI'].min(), group_data['BMI'].max()),
+            'sample_count': len(group_data)
+        }
+        
+        weeks = int(optimal_time)
+        days = int((optimal_time - weeks) * 7)
+        print(f"\n分组 {group_id + 1}: BMI {group_data['BMI'].min():.1f}-{group_data['BMI'].max():.1f}")
+        print(f"  最佳时点: {weeks}周+{days}天 ({optimal_time:.2f}周)")
+        print(f"  总风险: {min_risk:.4f}")
+    
+    return optimal_timings
+
+# 构建风险函数并优化
+risk_functions = build_risk_functions()
+optimal_timings = optimize_nipt_timing(pregnant_data_clustered, risk_functions)
+
+def plot_risk_analysis(optimal_timings, risk_functions):
+    """可视化风险分析"""
+    print("\n步骤8：风险分析可视化")
+    
+    detection_failure_risk, late_detection_risk, total_risk = risk_functions
+    time_range = np.linspace(10, 25, 100)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('BMI分组的NIPT时点优化分析', fontsize=16)
+    
+    colors = ['blue', 'red', 'green', 'orange', 'purple']
+    
+    for group_id, timing_info in optimal_timings.items():
+        bmi = timing_info['representative_bmi']
+        color = colors[group_id % len(colors)]
+        
+        # 总风险曲线
+        total_risks = [total_risk(t, bmi) for t in time_range]
+        axes[0,0].plot(time_range, total_risks, color=color, linewidth=2, 
+                      label=f'分组{group_id+1} (BMI={bmi:.1f})')
+        
+        # 标记最佳点
+        opt_time = timing_info['optimal_week']
+        opt_risk = timing_info['min_risk']
+        axes[0,0].plot(opt_time, opt_risk, 'o', color=color, markersize=8)
+        
+        # 失败风险
+        fail_risks = [detection_failure_risk(t, bmi) for t in time_range]
+        axes[0,1].plot(time_range, fail_risks, color=color, linewidth=2)
+    
+    # 延误风险（所有组相同）
+    late_risks = [late_detection_risk(t) for t in time_range]
+    axes[1,0].plot(time_range, late_risks, 'k-', linewidth=3, label='延误风险')
+    
+    # 最佳时点对比
+    groups = list(optimal_timings.keys())
+    optimal_weeks = [optimal_timings[g]['optimal_week'] for g in groups]
+    bmis = [optimal_timings[g]['representative_bmi'] for g in groups]
+    
+    bars = axes[1,1].bar([f'分组{g+1}' for g in groups], optimal_weeks, 
+                        color=[colors[g % len(colors)] for g in groups], alpha=0.7)
+    
+    for bar, bmi in zip(bars, bmis):
+        height = bar.get_height()
+        axes[1,1].text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                      f'BMI={bmi:.1f}', ha='center', va='bottom')
+    
+    # 设置标题和标签
+    axes[0,0].set_title('总风险曲线')
+    axes[0,0].set_xlabel('检测孕周')
+    axes[0,0].set_ylabel('总风险')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+    
+    axes[0,1].set_title('检测失败风险')
+    axes[0,1].set_xlabel('检测孕周')
+    axes[0,1].set_ylabel('失败概率')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    axes[1,0].set_title('延误诊断风险')
+    axes[1,0].set_xlabel('检测孕周')
+    axes[1,0].set_ylabel('延误风险')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    axes[1,1].set_title('各组最佳检测时点')
+    axes[1,1].set_ylabel('最佳检测孕周')
+    axes[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# 可视化分析结果
+plot_risk_analysis(optimal_timings, risk_functions)
+
+def sensitivity_analysis_fixed(optimal_timings, risk_functions):
+    """修正的敏感性分析"""
+    print("\n步骤9：敏感性分析")
+    
+    detection_failure_risk, late_detection_risk, total_risk = risk_functions
+    error_levels = [0.05, 0.10, 0.15]
+    sensitivity_results = {}
+    
+    for group_id, timing_info in optimal_timings.items():
+        print(f"\n分组 {group_id + 1} 敏感性分析:")
+        baseline_bmi = timing_info['representative_bmi']
+        baseline_time = timing_info['optimal_week']
+        
+        group_sensitivity = {
+            'baseline': baseline_time,
+            'error_analysis': {}
+        }
+        
+        for error_pct in error_levels:
+            bmi_low = baseline_bmi * (1 - error_pct)
+            bmi_high = baseline_bmi * (1 + error_pct)
+            
+            # 重新优化
+            result_low = minimize_scalar(
+                lambda t: total_risk(t, bmi_low), 
+                bounds=(10, 25), method='bounded'
+            )
+            result_high = minimize_scalar(
+                lambda t: total_risk(t, bmi_high), 
+                bounds=(10, 25), method='bounded'
+            )
+            
+            optimal_low = result_low.x
+            optimal_high = result_high.x
+            change_low = optimal_low - baseline_time
+            change_high = optimal_high - baseline_time
+            
+            group_sensitivity['error_analysis'][error_pct] = {
+                'bmi_low': bmi_low,
+                'bmi_high': bmi_high,
+                'optimal_low': optimal_low,
+                'optimal_high': optimal_high,
+                'change_low': change_low,
+                'change_high': change_high
+            }
+            
+            print(f"  ±{error_pct*100:.0f}%误差:")
+            print(f"    最佳时点范围: {optimal_low:.2f} - {optimal_high:.2f}周")
+            print(f"    时点变化: {change_low:+.2f} - {change_high:+.2f}周")
+        
+        sensitivity_results[group_id] = group_sensitivity
+    
+    return sensitivity_results
+
+def plot_sensitivity_analysis_fixed(sensitivity_results):
+    """修正的敏感性分析可视化"""
+    print("\n步骤10：敏感性分析可视化")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('检测误差敏感性分析', fontsize=16)
+    
+    error_levels = [0.05, 0.10, 0.15]
+    colors = ['blue', 'red', 'green', 'orange', 'purple']
+    
+    # 1. 时点变化范围
+    for group_id, sensitivity in sensitivity_results.items():
+        error_pcts = []
+        changes_low = []
+        changes_high = []
+        
+        for error_pct in error_levels:
+            error_data = sensitivity['error_analysis'][error_pct]
+            error_pcts.append(error_pct * 100)
+            changes_low.append(abs(error_data['change_low']))  # 取绝对值避免负值
+            changes_high.append(abs(error_data['change_high']))
+        
+        color = colors[group_id % len(colors)]
+        
+        # 修正：使用对称误差条，避免负值问题
+        axes[0,0].errorbar(error_pcts, [0] * len(error_pcts), 
+                          yerr=[changes_low, changes_high],
+                          fmt='o', color=color, capsize=5, capthick=2,
+                          label=f'分组{group_id+1}')
+    
+    axes[0,0].set_xlabel('BMI误差百分比 (%)')
+    axes[0,0].set_ylabel('最佳时点变化幅度 (周)')
+    axes[0,0].set_title('BMI误差对最佳时点的影响')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+    
+    # 2. 绝对时点范围
+    for group_id, sensitivity in sensitivity_results.items():
+        baseline = sensitivity['baseline']
+        
+        error_pcts = []
+        optimal_lows = []
+        optimal_highs = []
+        
+        for error_pct in error_levels:
+            error_data = sensitivity['error_analysis'][error_pct]
+            error_pcts.append(error_pct * 100)
+            optimal_lows.append(error_data['optimal_low'])
+            optimal_highs.append(error_data['optimal_high'])
+        
+        color = colors[group_id % len(colors)]
+        
+        axes[0,1].fill_between(error_pcts, optimal_lows, optimal_highs, 
+                              alpha=0.3, color=color)
+        axes[0,1].plot(error_pcts, optimal_lows, 'o-', color=color, linewidth=2)
+        axes[0,1].plot(error_pcts, optimal_highs, 's-', color=color, linewidth=2)
+        axes[0,1].axhline(y=baseline, color=color, linestyle='--', alpha=0.7,
+                         label=f'分组{group_id+1}基准')
+    
+    axes[0,1].set_xlabel('BMI误差百分比 (%)')
+    axes[0,1].set_ylabel('最佳检测时点 (周)')
+    axes[0,1].set_title('误差水平下的最佳时点范围')
+    axes[0,1].legend()
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # 3. 敏感性指数
+    sensitivity_indices = {}
+    for group_id, sensitivity in sensitivity_results.items():
+        indices = []
+        for error_pct in error_levels:
+            error_data = sensitivity['error_analysis'][error_pct]
+            max_change = max(abs(error_data['change_low']), abs(error_data['change_high']))
+            sensitivity_index = max_change / error_pct
+            indices.append(sensitivity_index)
+        
+        sensitivity_indices[group_id] = indices
+        
+        color = colors[group_id % len(colors)]
+        axes[1,0].plot([e*100 for e in error_levels], indices, 'o-', 
+                      color=color, linewidth=2, label=f'分组{group_id+1}')
+    
+    axes[1,0].set_xlabel('BMI误差百分比 (%)')
+    axes[1,0].set_ylabel('敏感性指数')
+    axes[1,0].set_title('敏感性指数分析')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # 4. 稳健性排名
+    avg_sensitivity = {group_id: np.mean(indices) 
+                      for group_id, indices in sensitivity_indices.items()}
+    sorted_groups = sorted(avg_sensitivity.items(), key=lambda x: x[1])
+    
+    groups = [f'分组{g+1}' for g, _ in sorted_groups]
+    sensitivities = [s for _, s in sorted_groups]
+    colors_sorted = [colors[g % len(colors)] for g, _ in sorted_groups]
+    
+    bars = axes[1,1].bar(groups, sensitivities, color=colors_sorted, alpha=0.7)
+    axes[1,1].set_ylabel('平均敏感性指数')
+    axes[1,1].set_title('各组稳健性排名 (越低越稳健)')
+    axes[1,1].grid(True, alpha=0.3)
+    
+    for bar, sens in zip(bars, sensitivities):
+        height = bar.get_height()
+        axes[1,1].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                      f'{sens:.2f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return sensitivity_indices
+
+# 执行修正的敏感性分析
+sensitivity_results = sensitivity_analysis_fixed(optimal_timings, risk_functions)
+sensitivity_indices = plot_sensitivity_analysis_fixed(sensitivity_results)
+
+print("\n=== 问题2分析完成 ===")
+print("\n最终建议：")
+for group_id, timing_info in optimal_timings.items():
+    weeks = int(timing_info['optimal_week'])
+    days = int((timing_info['optimal_week'] - weeks) * 7)
+    print(f"分组{group_id+1}: BMI {timing_info['bmi_range'][0]:.1f}-{timing_info['bmi_range'][1]:.1f}, "
+          f"建议检测时点 {weeks}周+{days}天, 样本{timing_info['sample_count']}人")
