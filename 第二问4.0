@@ -1,0 +1,361 @@
+import pandas as pd
+import numpy as np
+from lifelines import KaplanMeierFitter
+import matplotlib.pyplot as plt
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+
+# --------------------------
+# 核心修改：更新为临床常用BMI分组标准
+# 共9组：<18.5, 18.5-24, 24-26, 26-28, 28-30, 30-32, 32-34, 34-36, ≥36
+# 贴合WHO及国内临床BMI分级标准，更利于临床应用
+# --------------------------
+def assign_bmi_group(bmi):
+    if pd.isna(bmi):
+        return np.nan
+    if bmi < 18.5:
+        return 'BMI组 <18.5'  # 低体重
+    elif 18.5 <= bmi < 24:
+        return 'BMI组 18.5-24'  # 正常体重
+    elif 24 <= bmi < 26:
+        return 'BMI组 24-26'  # 超重前期
+    elif 26 <= bmi < 28:
+        return 'BMI组 26-28'  # 轻度超重
+    elif 28 <= bmi < 30:
+        return 'BMI组 28-30'  # 肥胖前期
+    elif 30 <= bmi < 32:
+        return 'BMI组 30-32'  # 轻度肥胖
+    elif 32 <= bmi < 34:
+        return 'BMI组 32-34'  # 中度肥胖
+    elif 34 <= bmi < 36:
+        return 'BMI组 34-36'  # 重度肥胖1
+    elif bmi >= 36:
+        return 'BMI组 ≥36'  # 重度肥胖2
+    else:
+        return np.nan
+
+
+# --------------------------
+# 数据读取与预处理（保留原有逻辑）
+# --------------------------
+def read_csv_robust(path):
+    encodings = ['utf-8-sig', 'gb18030', 'gbk', 'utf-8']
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, 'cleaned_data最终.csv')
+df_raw = read_csv_robust(CSV_PATH)
+
+# 规范列名
+col_map = {
+    '孕妇代码': 'subject_id',
+    '孕妇BMI': 'bmi',
+    'Y染色体浓度': 'y_fraction',
+    '检测孕周_数值': 'ga_weeks'
+}
+missing_cols = [c for c in col_map.keys() if c not in df_raw.columns]
+if missing_cols:
+    raise ValueError(f'缺失必要列: {missing_cols}')
+
+df = df_raw.rename(columns=col_map).copy()
+
+# 转换数据类型并清洗
+for c in ['bmi', 'y_fraction', 'ga_weeks']:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+df = df[~df['subject_id'].isna()]
+df = df.dropna(subset=['bmi', 'y_fraction', 'ga_weeks'])
+
+# 应用新BMI分组
+df['bmi_group'] = df['bmi'].apply(assign_bmi_group)
+
+
+# --------------------------
+# 阈值计算与达标时间函数（保留原有逻辑）
+# --------------------------
+def infer_threshold(series, base_percent=4.0):
+    s = series.dropna()
+    if s.empty:
+        return base_percent / 100.0
+    if s.median() > 1.0 or s.quantile(0.9) > 1.0:
+        return base_percent
+    return base_percent / 100.0
+
+
+threshold = infer_threshold(df['y_fraction'], base_percent=4.0)
+
+
+def subject_time_to_threshold(group_df, thr):
+    g = group_df.sort_values('ga_weeks')
+    reached = g[g['y_fraction'] >= thr]
+    if not reached.empty:
+        return pd.Series({'time': float(reached['ga_weeks'].iloc[0]), 'event': 1})
+    return pd.Series({'time': float(g['ga_weeks'].max()), 'event': 0})
+
+
+# 构建生存分析数据集
+records = []
+for sid, g in df.groupby('subject_id', sort=False):
+    res = subject_time_to_threshold(g, threshold)
+    records.append({
+        'patient_id': sid,
+        'bmi': float(g['bmi'].iloc[0]),
+        'bmi_group': g['bmi_group'].iloc[0],
+        'time': float(res['time']),
+        'event': int(res['event'])
+    })
+
+survival_df = pd.DataFrame(records)
+survival_df = survival_df.dropna(subset=['bmi_group'])
+
+# 新BMI分组列表（按顺序排列）
+bmi_groups = [
+    'BMI组 <18.5', 'BMI组 18.5-24', 'BMI组 24-26',
+    'BMI组 26-28', 'BMI组 28-30', 'BMI组 30-32',
+    'BMI组 32-34', 'BMI组 34-36', 'BMI组 ≥36'
+]
+best_times_base = {}  # 基准最佳时点（无误差）
+
+# --------------------------
+# 基准最佳时点计算与可视化（适配新分组）
+# --------------------------
+# 动态调整绘图布局（9组数据采用3×3网格）
+present_groups = [g for g in bmi_groups if (survival_df['bmi_group'] == g).any()]
+n = len(present_groups)
+ncols = 3
+nrows = int(np.ceil(n / ncols)) if n > 0 else 1
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5.5 * ncols, 4.0 * nrows))
+if nrows * ncols == 1:
+    axes = np.array([axes])
+axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+
+# 计算每组基准时点并绘图
+for i, group in enumerate(present_groups):
+    ax = axes[i]
+    gd = survival_df[survival_df['bmi_group'] == group]
+    if gd.empty:
+        ax.set_visible(False)
+        continue
+
+    # Kaplan-Meier生存分析
+    kmf = KaplanMeierFitter()
+    kmf.fit(durations=gd['time'], event_observed=gd['event'], label=group)
+    sf_df = kmf.survival_function_
+    sf = sf_df.iloc[:, 0]
+
+    # 计算95%达标时点（S(t)≤0.05）
+    leq = sf[sf <= 0.05]
+    best_time = float(leq.index.min()) if not leq.empty else np.nan
+    best_times_base[group] = best_time
+
+    # 绘图
+    kmf.plot_survival_function(ax=ax)
+    ax.axhline(y=0.05, color='r', linestyle='--', label='S(t)=0.05（95%达标）')
+    if not np.isnan(best_time):
+        ax.axvline(x=best_time, color='g', linestyle='--', label=f'最佳时点: {best_time:.2f}周')
+    ax.set_title(f'{group}', fontsize=10)
+    ax.set_xlabel('孕周（周）')
+    ax.set_ylabel('生存概率 S(t)')
+    ax.legend(fontsize=8)
+
+# 隐藏多余子图
+start_idx = (i + 1) if 'i' in locals() else 0
+for j in range(start_idx, len(axes)):
+    axes[j].set_visible(False)
+
+plt.tight_layout()
+plt.savefig(os.path.join(BASE_DIR, 'survival_curves_clinical_bmi_groups.png'), dpi=200)
+try:
+    plt.show()
+except Exception:
+    pass
+
+# --------------------------
+# 基准结果输出（新分组）
+# --------------------------
+print('=' * 80)
+print('【基准结果（临床BMI分组）】无误差时的最佳NIPT时点（95%达标率）：')
+print('=' * 80)
+for group in bmi_groups:
+    sample_count = (survival_df['bmi_group'] == group).sum()
+    if group in best_times_base and not np.isnan(best_times_base[group]):
+        print(f'{group:<15}：{best_times_base[group]:.2f} 周（样本数：{sample_count}）')
+    else:
+        reason = '无样本' if sample_count == 0 else '未达95%达标率'
+        print(f'{group:<15}：无法估计（{reason}，样本数：{sample_count}）')
+
+
+# --------------------------
+# 误差影响分析模块（适配新分组）
+# --------------------------
+def add_bmi_measurement_error(bmi_series, error_pct):
+    """模拟BMI测量误差（±3%~±10%）"""
+    np.random.seed(42)
+    error = bmi_series * error_pct * np.random.normal(loc=0, scale=1, size=len(bmi_series))
+    error = np.clip(error, -bmi_series * error_pct, bmi_series * error_pct)  # 控制误差范围
+    return bmi_series + error
+
+
+def add_yfraction_detection_error(yfraction_series, error_pct):
+    """模拟Y染色体浓度检测误差（±5%~±20%）"""
+    np.random.seed(42)
+    error = yfraction_series * error_pct * np.random.normal(loc=0, scale=1, size=len(yfraction_series))
+    return np.maximum(yfraction_series + error, 0)  # 确保浓度非负
+
+
+def recalculate_best_time_with_error(df_original, error_type, error_pct, threshold):
+    """重新计算带误差的最佳时点（适配新BMI分组）"""
+    df_error = df_original.copy()
+
+    # 加入误差并重新分组（若为BMI误差）
+    if error_type == 'bmi':
+        df_error['bmi'] = add_bmi_measurement_error(df_error['bmi'], error_pct)
+        df_error['bmi_group'] = df_error['bmi'].apply(assign_bmi_group)  # 应用新分组逻辑
+    elif error_type == 'yfraction':
+        df_error['y_fraction'] = add_yfraction_detection_error(df_error['y_fraction'], error_pct)
+
+    # 重新计算个体达标时间
+    records_error = []
+    for sid, g in df_error.groupby('subject_id', sort=False):
+        if pd.isna(g['bmi_group'].iloc[0]):
+            continue
+        res = subject_time_to_threshold(g, threshold)
+        records_error.append({
+            'patient_id': sid,
+            'bmi': float(g['bmi'].iloc[0]),
+            'bmi_group': g['bmi_group'].iloc[0],
+            'time': float(res['time']),
+            'event': int(res['event'])
+        })
+
+    # 计算带误差的最佳时点
+    survival_df_error = pd.DataFrame(records_error)
+    survival_df_error = survival_df_error.dropna(subset=['bmi_group'])
+    best_times_error = {}
+
+    for group in bmi_groups:
+        gd = survival_df_error[survival_df_error['bmi_group'] == group]
+        if gd.empty:
+            best_times_error[group] = np.nan
+            continue
+
+        kmf = KaplanMeierFitter()
+        kmf.fit(durations=gd['time'], event_observed=gd['event'], label=group)
+        sf_df = kmf.survival_function_
+        sf = sf_df.iloc[:, 0]
+        leq = sf[sf <= 0.05]
+        best_times_error[group] = float(leq.index.min()) if not leq.empty else np.nan
+
+    return best_times_error, survival_df_error
+
+
+# 定义误差场景（与临床检测误差范围一致）
+error_scenarios = [
+    {'type': 'bmi', 'pct': 0.03, 'name': 'BMI测量误差±3%'},
+    {'type': 'bmi', 'pct': 0.05, 'name': 'BMI测量误差±5%'},
+    {'type': 'bmi', 'pct': 0.10, 'name': 'BMI测量误差±10%'},
+    {'type': 'yfraction', 'pct': 0.05, 'name': 'Y浓度误差±5%'},
+    {'type': 'yfraction', 'pct': 0.10, 'name': 'Y浓度误差±10%'},
+    {'type': 'yfraction', 'pct': 0.20, 'name': 'Y浓度误差±20%'}
+]
+
+# 存储所有场景结果
+error_results = {'基准（无误差）': best_times_base}
+
+# 计算各误差场景下的最佳时点
+print(f'\n' + '=' * 80)
+print('【误差影响分析（临床BMI分组）】不同误差场景下的最佳时点：')
+print('=' * 80)
+for scenario in error_scenarios:
+    err_type = scenario['type']
+    err_pct = scenario['pct']
+    err_name = scenario['name']
+
+    print(f'\n▶ 计算场景：{err_name}')
+    best_times_err, _ = recalculate_best_time_with_error(df, err_type, err_pct, threshold)
+    error_results[err_name] = best_times_err
+
+    # 输出当前场景结果（含与基准的差异）
+    for group in bmi_groups:
+        sample_count = (survival_df['bmi_group'] == group).sum()
+        if group in best_times_err and not np.isnan(best_times_err[group]) and group in best_times_base:
+            diff = best_times_err[group] - best_times_base[group]
+            print(f'  {group:<15}：{best_times_err[group]:.2f}周（与基准差异：{diff:+.2f}周，样本数：{sample_count}）')
+        elif group in best_times_err and not np.isnan(best_times_err[group]):
+            print(f'  {group:<15}：{best_times_err[group]:.2f}周（无基准对比，样本数：{sample_count}）')
+        else:
+            print(f'  {group:<15}：无法估计（样本数：{sample_count}）')
+
+
+# --------------------------
+# 误差敏感度分析（量化误差影响）
+# --------------------------
+def calculate_error_sensitivity(error_results, base_key='基准（无误差）'):
+    """计算敏感度：|时点变化量| / 误差百分比（值越小越稳健）"""
+    sensitivity_df = pd.DataFrame(index=bmi_groups, columns=list(error_results.keys()))
+
+    for scenario_name in error_results.keys():
+        if scenario_name == base_key:
+            sensitivity_df[scenario_name] = 0.0
+            continue
+
+        # 解析误差百分比
+        if '±' in scenario_name and '%' in scenario_name:
+            err_pct = float(scenario_name.split('±')[1].replace('%', '')) / 100
+        else:
+            err_pct = 0.05  # 默认值
+
+        # 计算每组敏感度
+        for group in bmi_groups:
+            base_time = error_results[base_key].get(group, np.nan)
+            err_time = error_results[scenario_name].get(group, np.nan)
+
+            if not np.isnan(base_time) and not np.isnan(err_time) and err_pct > 0:
+                sensitivity = abs(err_time - base_time) / err_pct
+                sensitivity_df.loc[group, scenario_name] = round(sensitivity, 4)
+            else:
+                sensitivity_df.loc[group, scenario_name] = np.nan
+
+    return sensitivity_df
+
+
+# 计算并输出敏感度结果
+sensitivity_df = calculate_error_sensitivity(error_results)
+print(f'\n' + '=' * 80)
+print('【误差敏感度分析】敏感度 = |最佳时点变化量| / 误差百分比（越小越稳健）')
+print('=' * 80)
+print(sensitivity_df.round(4))
+
+# --------------------------
+# 结果保存（新增临床分组结果文件）
+# --------------------------
+# 保存基准最佳时点
+result_rows = []
+for group in bmi_groups:
+    t = best_times_base.get(group, np.nan)
+    sample_count = (survival_df['bmi_group'] == group).sum()
+    result_rows.append({
+        'BMI_Group': group,
+        'Best_NIPT_Time_Weeks': t,
+        'Sample_Count': sample_count
+    })
+result_df = pd.DataFrame(result_rows)
+result_df.to_csv(os.path.join(BASE_DIR, 'best_nipt_times_clinical_bmi.csv'), index=False, encoding='utf-8-sig')
+
+# 保存个体级数据
+survival_df.to_csv(os.path.join(BASE_DIR, 'subject_time_to_threshold_clinical.csv'), index=False, encoding='utf-8-sig')
+
+print(f'\n结果已保存至脚本目录：')
+print(f'1. 临床BMI分组最佳时点：best_nipt_times_clinical_bmi.csv')
+print(f'2. 个体达标时间数据：subject_time_to_threshold_clinical.csv')
+print(f'3. 生存曲线图：survival_curves_clinical_bmi_groups.png')
