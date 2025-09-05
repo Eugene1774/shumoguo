@@ -1,0 +1,160 @@
+import pandas as pd
+import numpy as np
+from lifelines import KaplanMeierFitter
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+# 读取CSV（编码容错）并规范字段
+def read_csv_robust(path):
+    encodings = ['utf-8-sig', 'gb18030', 'gbk', 'utf-8']
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
+
+df_raw = read_csv_robust('cleaned_data最终(1).csv')
+
+# 规范列名
+col_map = {
+    '孕妇代码': 'subject_id',
+    '孕妇BMI': 'bmi',
+    'Y染色体浓度': 'y_fraction',
+    '检测孕周_数值': 'ga_weeks'
+}
+missing_cols = [c for c in col_map.keys() if c not in df_raw.columns]
+if missing_cols:
+    raise ValueError(f'缺失必要列: {missing_cols}')
+
+df = df_raw.rename(columns=col_map).copy()
+
+# 转换数据类型
+for c in ['bmi', 'y_fraction', 'ga_weeks']:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+df = df[~df['subject_id'].isna()]
+df = df.dropna(subset=['bmi', 'y_fraction', 'ga_weeks'])
+
+# BMI分组
+def assign_bmi_group(bmi):
+    if pd.isna(bmi):
+        return np.nan
+    if bmi < 18.5:
+        return '<18.5'
+    elif 18.5 <= bmi < 24:
+        return '18.5-24'
+    elif 24 <= bmi < 28:
+        return '24-28'
+    elif 28 <= bmi < 32:
+        return '28-32'
+    else:
+        return '>=32'
+
+df['bmi_group'] = df['bmi'].apply(assign_bmi_group)
+
+# 阈值（4%）的尺度自适应：若数据以百分数表示，则阈值为4；若为小数，则为0.04
+def infer_threshold(series, base_percent=4.0):
+    s = series.dropna()
+    if s.empty:
+        return base_percent / 100.0
+    if s.median() > 1.0 or s.quantile(0.9) > 1.0:
+        return base_percent
+    return base_percent / 100.0
+
+threshold = infer_threshold(df['y_fraction'], base_percent=4.0)
+
+# 计算每位孕妇的达标时间（右删失）
+def subject_time_to_threshold(group_df, thr):
+    g = group_df.sort_values('ga_weeks')
+    reached = g[g['y_fraction'] >= thr]
+    if not reached.empty:
+        return pd.Series({'time': float(reached['ga_weeks'].iloc[0]), 'event': 1})
+    return pd.Series({'time': float(g['ga_weeks'].max()), 'event': 0})
+
+records = []
+for sid, g in df.groupby('subject_id', sort=False):
+    res = subject_time_to_threshold(g, threshold)
+    records.append({
+        'patient_id': sid,
+        'bmi': float(g['bmi'].iloc[0]),
+        'bmi_group': g['bmi_group'].iloc[0],
+        'time': float(res['time']),
+        'event': int(res['event'])
+    })
+
+survival_df = pd.DataFrame(records)
+
+# 仅保留存在BMI分组的数据
+survival_df = survival_df.dropna(subset=['bmi_group'])
+
+# 计算每个BMI组的95%分位达标孕周（F(t)≥0.95 -> S(t)≤0.05）
+bmi_groups = ['<18.5', '18.5-24', '24-28', '28-32', '>=32']
+best_times = {}
+
+# 动态绘图布局
+present_groups = [g for g in bmi_groups if (survival_df['bmi_group'] == g).any()]
+n = len(present_groups)
+ncols = 3
+nrows = int(np.ceil(n / ncols)) if n > 0 else 1
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5.5*ncols, 4.0*nrows))
+if nrows * ncols == 1:
+    axes = np.array([axes])
+axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+
+for i, group in enumerate(present_groups):
+    ax = axes[i]
+    gd = survival_df[survival_df['bmi_group'] == group]
+    if gd.empty:
+        ax.set_visible(False)
+        continue
+    kmf = KaplanMeierFitter()
+    kmf.fit(durations=gd['time'], event_observed=gd['event'], label=group)
+    # 兼容不同lifelines版本：列名可能为'KM_estimate'或为label，取第一列更稳妥
+    sf_df = kmf.survival_function_
+    sf = sf_df.iloc[:, 0]
+    leq = sf[sf <= 0.05]
+    best_time = float(leq.index.min()) if not leq.empty else np.nan
+    best_times[group] = best_time
+    kmf.plot_survival_function(ax=ax)
+    ax.axhline(y=0.05, color='r', linestyle='--', label='S(t)=0.05')
+    if not np.isnan(best_time):
+        ax.axvline(x=best_time, color='g', linestyle='--', label=f'95%分位: {best_time:.2f}')
+    ax.set_title(f'BMI组: {group}')
+    ax.set_xlabel('孕周（周）')
+    ax.set_ylabel('生存概率 S(t)')
+    ax.legend()
+
+# 隐藏多余子图（兼容无有效组时i未定义）
+start_idx = (i + 1) if 'i' in locals() else 0
+for j in range(start_idx, len(axes)):
+    axes[j].set_visible(False)
+
+plt.tight_layout()
+plt.savefig('survival_curves.png', dpi=200)
+try:
+    plt.show()
+except Exception:
+    pass
+
+# 输出结果
+print('最佳NIPT时点（基于Kaplan-Meier的95%分位数）：')
+for group in bmi_groups:
+    if group in best_times and not np.isnan(best_times[group]):
+        print(f'BMI组 {group}: {best_times[group]:.2f} 周')
+    else:
+        print(f'BMI组 {group}: 无法估计（未达到95%事件或样本不足）')
+
+# 保存结果
+result_rows = []
+for group in bmi_groups:
+    t = best_times.get(group, np.nan)
+    result_rows.append({'BMI_Group': group, 'Best_NIPT_Time_Weeks': t})
+result_df = pd.DataFrame(result_rows)
+result_df.to_csv('best_nipt_times.csv', index=False, encoding='utf-8-sig')
+
+# 保存个体级别达标时间数据
+survival_df.to_csv('subject_time_to_threshold.csv', index=False, encoding='utf-8-sig')
+print('结果已保存到 best_nipt_times.csv 与 subject_time_to_threshold.csv；曲线图保存为 survival_curves.png')
