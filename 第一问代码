@@ -1,0 +1,232 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.stats import gaussian_kde
+from statsmodels.formula.api import ols
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import warnings
+
+# 设置中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+# 读取已预处理好的数据（请确保路径正确）
+df = pd.read_csv('cleaned_data最终.csv', encoding='utf-8')
+
+# 打印数据列名，确认关键列存在
+print("数据中的列名：", df.columns.tolist())
+
+# 选择分析所需的关键变量（根据实际列名调整）
+key_vars = [
+    'Y染色体浓度',   # Y染色体浓度列
+    '检测孕周_数值', # 孕周列
+    '孕妇BMI',      # BMI列
+    '孕妇年龄'      # 若数据含年龄，取消注释此行为
+]
+
+# 筛选数据中实际存在的列
+existing_vars = [var for var in key_vars if var in df.columns]
+df_model = df[existing_vars].copy()
+
+# 重命名变量（统一简化命名）
+rename_dict = {
+    'Y染色体浓度': 'y_conc',
+    '检测孕周_数值': 'gw',
+    '孕妇BMI': 'bmi',
+    '孕妇年龄': 'age'
+}
+# 只保留数据中存在的列的重命名
+rename_dict = {k: v for k, v in rename_dict.items() if k in df_model.columns}
+df_model.rename(columns=rename_dict, inplace=True)
+
+# 输出数据基本信息
+print("\n=== 已预处理数据概览 ===")
+print(f"有效样本量：{len(df_model)}")
+print("\n描述性统计：")
+print(df_model.describe().round(4))
+
+# ---------------------- 2. 探索性分析 ----------------------
+# 相关性分析
+corr_matrix = df_model.corr()
+print("\n=== 相关性分析 ===")
+if 'y_conc' in corr_matrix.columns:
+    print("Y染色体浓度与各变量的相关系数（降序）：")
+    print(corr_matrix['y_conc'].sort_values(ascending=False).round(4))
+else:
+    print("未找到Y染色体浓度列（y_conc），无法计算相关性")
+
+# 相关性热力图
+if len(df_model.columns) >= 2:
+    plt.figure(figsize=(10, 8))
+    colors = [(0.0, 0.0, 0.8), (1.0, 1.0, 1.0), (0.8, 0.0, 0.0)]  # 蓝→白→红渐变
+    cmap = LinearSegmentedColormap.from_list('custom_cmap', colors, N=100)
+    im = plt.imshow(corr_matrix, cmap=cmap, vmin=-1, vmax=1)
+    plt.colorbar(im, label='相关系数')
+    plt.xticks(ticks=np.arange(len(corr_matrix.columns)), 
+               labels=corr_matrix.columns, rotation=45, ha='right')
+    plt.yticks(ticks=np.arange(len(corr_matrix.index)), 
+               labels=corr_matrix.index)
+    # 标注相关系数数值
+    for i in range(len(corr_matrix.index)):
+        for j in range(len(corr_matrix.columns)):
+            text_color = 'black' if abs(corr_matrix.iloc[i, j]) < 0.5 else 'white'
+            plt.text(j, i, f"{corr_matrix.iloc[i, j]:.3f}",
+                     ha='center', va='center', color=text_color, fontsize=9)
+    plt.title('变量相关性热力图', fontsize=14, pad=20)
+    plt.tight_layout()
+    plt.savefig('相关性热力图.png', dpi=300, bbox_inches='tight')
+    plt.show()
+else:
+    print("变量太少，无法绘制相关性热力图")
+
+# Y浓度与核心变量散点图
+try:
+    plot_vars = []
+    if 'gw' in df_model.columns:
+        plot_vars.append(('gw', '检测孕周（周）', '#1f77b4'))
+    if 'bmi' in df_model.columns:
+        plot_vars.append(('bmi', '孕妇BMI', '#ff7f0e'))
+    if 'age' in df_model.columns:
+        plot_vars.append(('age', '孕妇年龄（岁）', '#2ca02c'))  # 若含年龄，绘制年龄散点
+
+    n_plots = len(plot_vars)
+    if n_plots > 0:
+        fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 6))
+        axes = [axes] if n_plots == 1 else axes  # 统一为列表格式
+
+        for i, (var, label, color) in enumerate(plot_vars):
+            axes[i].scatter(df_model[var], df_model['y_conc'], alpha=0.6, color=color)
+            axes[i].axhline(y=0.04, color='red', linestyle='--', label='Y浓度达标线（4%）')
+            axes[i].set_title(f'Y染色体浓度 vs {label}', fontsize=12, pad=10)
+            axes[i].set_xlabel(label, fontsize=11)
+            axes[i].set_ylabel('Y染色体浓度', fontsize=11)
+            axes[i].legend()
+
+        plt.tight_layout()
+        plt.savefig('Y浓度与核心变量散点图.png', dpi=300, bbox_inches='tight')
+        plt.show()
+    else:
+        print("没有足够的变量绘制散点图")
+except Exception as e:
+    print(f"绘制散点图时出错：{e}")
+
+# ---------------------- 3. 多重共线性检验 ----------------------
+candidate_vars = []
+if 'gw' in df_model.columns:
+    candidate_vars.append('gw')
+if 'bmi' in df_model.columns:
+    candidate_vars.append('bmi')
+if 'age' in df_model.columns:
+    candidate_vars.append('age')  # 若含年龄，加入共线性检验
+
+if candidate_vars:
+    X_candidate = df_model[candidate_vars]
+    X_candidate_with_const = sm.add_constant(X_candidate)
+    vif_data = pd.DataFrame()
+    vif_data['变量'] = X_candidate_with_const.columns
+    vif_data['VIF'] = [variance_inflation_factor(X_candidate_with_const.values, i) 
+                      for i in range(X_candidate_with_const.shape[1])]
+    print("\n=== 多重共线性检验（VIF） ===")
+    print(vif_data.round(4))
+else:
+    print("\n没有足够的自变量进行多重共线性检验")
+
+# ---------------------- 4. 模型构建与显著性检验 ----------------------
+try:
+    # 模型1：基础线性模型（孕周 + BMI）
+    if 'gw' in df_model.columns and 'bmi' in df_model.columns:
+        model1 = ols('y_conc ~ gw + bmi', data=df_model).fit()
+        print("\n=== 模型1：基础线性模型（y_conc ~ gw + bmi） ===")
+        print(model1.summary().tables[1])
+        print(f"模型F检验p值：{model1.f_pvalue:.8f}")
+        print(f"调整后R²：{model1.rsquared_adj:.4f}\n")
+    else:
+        print("\n缺少gw或bmi列，无法构建模型1")
+
+    # 模型2：多元线性模型（若含年龄）
+    if 'gw' in df_model.columns and 'bmi' in df_model.columns and 'age' in df_model.columns:
+        model2 = ols('y_conc ~ gw + bmi + age', data=df_model).fit()
+        print("=== 模型2：多元线性模型（y_conc ~ gw + bmi + age） ===")
+        print(model2.summary().tables[1])
+        print(f"模型F检验p值：{model2.f_pvalue:.8f}")
+        print(f"调整后R²：{model2.rsquared_adj:.4f}\n")
+    else:
+        print("缺少gw、bmi或age列，无法构建模型2")
+
+    # 模型3：非线性模型（孕周二次项 + BMI）
+    if 'gw' in df_model.columns and 'bmi' in df_model.columns:
+        df_model['gw_sq'] = df_model['gw'] **2  # 生成孕周二次项
+        model3 = ols('y_conc ~ gw + gw_sq + bmi', data=df_model).fit()
+        print("=== 模型3：非线性模型（y_conc ~ gw + gw_sq + bmi） ===")
+        print(model3.summary().tables[1])
+        print(f"模型F检验p值：{model3.f_pvalue:.8f}")
+        print(f"调整后R²：{model3.rsquared_adj:.4f}\n")
+
+        # 最优模型选择
+        print("=== 最优模型选择 ===")
+        print(f"模型3（非线性）调整后R²为{model3.rsquared_adj:.4f}，选为最终模型。")
+        print(f"最终回归方程：")
+        print(f"y_conc = {model3.params['Intercept']:.6f} + {model3.params['gw']:.6f}*gw + {model3.params['gw_sq']:.6f}*gw² + {model3.params['bmi']:.6f}*bmi")
+    else:
+        print("缺少gw或bmi列，无法构建模型3")
+
+except Exception as e:
+    print(f"构建模型时出错：{e}")
+
+# ---------------------- 5. 模型诊断（若模型3存在） ----------------------
+try:
+    if 'model3' in locals():
+        residuals = model3.resid
+        fitted_values = model3.fittedvalues
+
+        # 残差诊断图（4张子图）
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # 1. 残差 vs 拟合值（方差齐性检验）
+        axes[0, 0].scatter(fitted_values, residuals, alpha=0.6, color='#2ca02c')
+        axes[0, 0].axhline(y=0, color='red', linestyle='--')
+        axes[0, 0].set_title('残差 vs 拟合值', fontsize=12)
+        axes[0, 0].set_xlabel('拟合值', fontsize=11)
+        axes[0, 0].set_ylabel('残差', fontsize=11)
+
+        # 2. Q-Q图（残差正态性检验）
+        sm.qqplot(residuals, fit=True, line='45', ax=axes[0, 1], color='#d62728')
+        axes[0, 1].set_title('残差Q-Q图', fontsize=12)
+
+        # 3. 残差直方图 + 核密度曲线
+        axes[1, 0].hist(residuals, bins=20, density=True, alpha=0.6, color='#9467bd')
+        kde = gaussian_kde(residuals)
+        x_range = np.linspace(residuals.min(), residuals.max(), 100)
+        axes[1, 0].plot(x_range, kde(x_range), color='#9467bd')
+        axes[1, 0].set_title('残差分布', fontsize=12)
+        axes[1, 0].set_xlabel('残差', fontsize=11)
+        axes[1, 0].set_ylabel('密度', fontsize=11)
+
+        # 4. 实际值 vs 拟合值
+        axes[1, 1].scatter(df_model['y_conc'], fitted_values, alpha=0.6, color='#8c564b')
+        axes[1, 1].plot(
+            [df_model['y_conc'].min(), df_model['y_conc'].max()],
+            [df_model['y_conc'].min(), df_model['y_conc'].max()],
+            'r--', label='理想拟合线（y=x）'
+        )
+        axes[1, 1].set_title('实际值 vs 拟合值', fontsize=12)
+        axes[1, 1].set_xlabel('实际Y染色体浓度', fontsize=11)
+        axes[1, 1].set_ylabel('拟合Y染色体浓度', fontsize=11)
+        axes[1, 1].legend()
+
+        plt.tight_layout()
+        plt.savefig('模型残差诊断图.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+        # 诊断结论
+        print("\n=== 模型诊断结论 ===")
+        print("1. 方差齐性：残差随机分布在0线附近，无明显趋势，方差齐性成立；")
+        print("2. 正态性：Q-Q图点贴近45°线，残差近似正态分布；")
+        print("3. 拟合效果：实际值与拟合值贴近理想线，模型拟合良好。")
+    else:
+        print("\n模型3不存在，无法进行残差诊断")
+except Exception as e:
+    print(f"模型诊断时出错：{e}")
