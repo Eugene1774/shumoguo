@@ -1,0 +1,285 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import f_oneway, norm
+import warnings
+warnings.filterwarnings('ignore')
+# 中文字体配置（避免乱码）
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ------------------------------------------------------------------------------
+# 1. 数据加载与预处理（C题.pdf 4.4：男胎筛选+首次达标时间）
+# ------------------------------------------------------------------------------
+def load_preprocess_data(csv_path):
+    df = pd.read_csv(csv_path, encoding='utf-8')
+    # 筛选男胎（C题.pdf 4.4：男胎Y染色体浓度非空，女胎空白）
+    male_df = df[df['Y染色体浓度'].notna()].copy()
+    # 关键列（问题2思路.docx 1.2：孕妇代码/BMI/孕周/Y浓度）
+    key_cols = ['孕妇代码', '孕妇BMI', '检测孕周_数值', 'Y染色体浓度']
+    male_df = male_df[key_cols].dropna()
+    
+    # 计算首次达标时间（问题2思路.docx 1.4：首次Y≥4%的孕周）
+    first_qualified_week = {}
+    for pid in male_df['孕妇代码'].unique():
+        pid_data = male_df[male_df['孕妇代码'] == pid].sort_values('检测孕周_数值')
+        qualified_records = pid_data[pid_data['Y染色体浓度'] >= 4.0]
+        first_qualified_week[pid] = qualified_records.iloc[0]['检测孕周_数值'] if len(qualified_records) > 0 else 30.0
+    
+    male_df['first_qualified_week'] = male_df['孕妇代码'].map(first_qualified_week)
+    subject_df = male_df[['孕妇代码', '孕妇BMI', 'first_qualified_week']].drop_duplicates('孕妇代码')
+    
+    print("=== 数据预处理结果（C题问题2） ===")
+    print(f"有效男胎孕妇样本量：{len(subject_df)}")
+    print(f"BMI范围：{subject_df['孕妇BMI'].min():.1f}~{subject_df['孕妇BMI'].max():.1f} kg/m²\n")
+    return subject_df, male_df
+
+
+# ------------------------------------------------------------------------------
+# 2. BMI临床分组（C题.pdf 示例分组+ANOVA验证，问题2思路.docx 3.1）
+# ------------------------------------------------------------------------------
+def bmi_clinical_grouping(subject_df):
+    # BMI分组（C题.pdf 示例：[28,32),[32,36),[36,40),≥40）
+    bins = [28.0, 32.0, 36.0, 40.0, np.inf]
+    labels = ['肥胖I级(28-32)', '肥胖II级(32-36)', '肥胖III级(36-40)', '重度肥胖(≥40)']
+    subject_df['BMI_group'] = pd.cut(
+        subject_df['孕妇BMI'], bins=bins, labels=labels, right=False
+    )
+    
+    # 过滤空组（问题2思路.docx 3.1：组内同质性）
+    group_counts = subject_df['BMI_group'].value_counts().sort_index()
+    valid_groups = group_counts[group_counts > 0].index
+    subject_df = subject_df[subject_df['BMI_group'].isin(valid_groups)]
+    
+    # 输出分组结果
+    print("=== BMI分组结果（C题问题2） ===")
+    for group, count in group_counts.items():
+        bmi_range = group.split('(')[1].split(')')[0]
+        if count > 0:
+            print(f"{group}：{count}例，BMI区间：{bmi_range} kg/m²")
+        else:
+            print(f"{group}：0例（空组，已过滤）")
+    
+    # ANOVA验证（问题2思路.docx 3.1：组间异质性）
+    if len(valid_groups) >= 2:
+        group_data = [subject_df[subject_df['BMI_group']==g]['first_qualified_week'] for g in valid_groups]
+        f_stat, p_value = f_oneway(*group_data)
+        print(f"\nANOVA分组验证：F={f_stat:.3f}，p={p_value:.6f}")
+        print("结论：分组有效（组间达标时间差异显著）\n" if p_value < 0.05 else "警告：分组差异不显著，建议合并\n")
+    return subject_df, valid_groups
+
+
+# ------------------------------------------------------------------------------
+# 3. 风险系数定义+最佳时点计算（新增核心逻辑，贴合问题2思路.docx 4.1）
+# ------------------------------------------------------------------------------
+def calculate_risk_and_best_time(subject_df, valid_groups):
+    """
+    新增：1. 风险系数（越晚越高）；2. 潜在风险=风险系数×(1-达标率)；3. 最佳时点
+    风险系数规则（C题.pdf 风险分级）：
+    - 早期（≤12周）：系数1（风险低）
+    - 中期（13-27周）：系数2（风险高）
+    - 晚期（≥28周）：系数5（风险极高）
+    """
+    best_time_results = []
+    
+    for group in valid_groups:
+        group_data = subject_df[subject_df['BMI_group'] == group]
+        n = len(group_data)
+        bmi_range = group.split('(')[1].split(')')[0]
+        
+        # 计算分位数（问题2思路.docx 4.2：优先25%分位数尽早检测）
+        q25 = group_data['first_qualified_week'].quantile(0.25)
+        median = group_data['first_qualified_week'].quantile(0.5)
+        
+        # 达标率计算
+        qualified_q25 = len(group_data[group_data['first_qualified_week'] <= q25]) / n * 100
+        
+        # 步骤1：确定最佳时点+对应风险系数（越晚系数越高）
+        if qualified_q25 >= 80:  # 问题2思路.docx 4.2：达标率≥80%
+            best_week = round(q25)
+            final_qualified = qualified_q25
+        else:
+            best_week = round(median)
+            final_qualified = len(group_data[group_data['first_qualified_week'] <= median]) / n * 100
+        
+        # 步骤2：根据最佳时点确定风险系数（越晚越高）
+        if best_week <= 12:
+            risk_coef = 1.0  # 早期：风险低
+            risk_level = "早期（风险低）"
+        elif 13 <= best_week <= 27:
+            risk_coef = 2.0  # 中期：风险高
+            risk_level = "中期（风险高）"
+        else:
+            risk_coef = 5.0  # 晚期：风险极高
+            risk_level = "晚期（风险极高）"
+        
+        # 步骤3：计算潜在风险（风险系数×未达标概率，未达标需重测→延迟时间→风险升高）
+        unqualified_rate = (1 - final_qualified / 100)  # 未达标概率
+        potential_risk = risk_coef * unqualified_rate  # 潜在风险值（越高越差）
+        
+        # 保存结果（新增风险系数、潜在风险列）
+        best_time_results.append({
+            'BMI分组': group,
+            'BMI区间(kg/m²)': bmi_range,
+            '样本量': n,
+            '最佳NIPT时点(周)': best_week,
+            '风险系数': risk_coef,
+            '达标率(%)': round(final_qualified, 1),
+            '潜在风险值': round(potential_risk, 3),
+            '风险等级': risk_level
+        })
+    
+    results_df = pd.DataFrame(best_time_results).sort_values('BMI分组')
+    print("=== 最佳时点+风险系数结果（C题问题2） ===")
+    print(results_df.to_string(index=False))
+    print(f"\n风险系数规则：早期≤12周(1) → 中期13-27周(2) → 晚期≥28周(5)（越晚越高）\n")
+    return results_df
+
+
+# ------------------------------------------------------------------------------
+# 4. 检测误差分析（C题.pdf 4.6测序误差，问题2思路.docx 5）
+# ------------------------------------------------------------------------------
+def error_impact_analysis(male_df, best_time_df):
+    if best_time_df.empty:
+        return pd.DataFrame(), 0.6
+    
+    # 估算检测误差（同一孕妇多次检测Y浓度波动）
+    multi_pids = male_df['孕妇代码'].value_counts()[male_df['孕妇代码'].value_counts()>=2].index
+    error_list = [np.std(male_df[male_df['孕妇代码']==pid]['Y染色体浓度'].values) for pid in multi_pids if len(male_df[male_df['孕妇代码']==pid]['Y染色体浓度'].values)>=2]
+    sigma = np.mean(error_list) if error_list else 0.6
+    
+    # 误差对达标率的影响
+    error_impact = []
+    for _, row in best_time_df.iterrows():
+        group = row['BMI分组']
+        best_week = row['最佳NIPT时点(周)']
+        group_pids = subject_df[subject_df['BMI_group']==group]['孕妇代码']
+        y_near = male_df[
+            (male_df['孕妇代码'].isin(group_pids)) &
+            (male_df['检测孕周_数值'].between(best_week-1, best_week+1))
+        ]['Y染色体浓度']
+        mu = y_near.mean() if len(y_near) > 0 else 4.5
+        
+        # 误差后达标率（正态分布）
+        z_score = (4.0 - mu)/sigma if sigma !=0 else -1.0
+        error_qualified = (1 - norm.cdf(z_score)) * 100
+        # 误差后潜在风险（更新未达标概率）
+        error_potential_risk = row['风险系数'] * (1 - error_qualified/100)
+        
+        error_impact.append({
+            'BMI分组': group,
+            '最佳时点(周)': best_week,
+            '检测误差σ(%)': round(sigma, 3),
+            '原达标率(%)': row['达标率(%)'],
+            '误差后达标率(%)': round(error_qualified, 1),
+            '原潜在风险': row['潜在风险值'],
+            '误差后潜在风险': round(error_potential_risk, 3)
+        })
+    
+    error_df = pd.DataFrame(error_impact).sort_values('BMI分组')
+    print("=== 检测误差影响分析 ===")
+    print(error_df.to_string(index=False))
+    return error_df, sigma
+
+
+# ------------------------------------------------------------------------------
+# 5. 可视化（强制显示所有图表，新增潜在风险子图）
+# ------------------------------------------------------------------------------
+def visualize_all_results(subject_df, best_time_df, error_df=None):
+    """
+    显示+保存所有图表：
+    1. 首次达标时间箱线图（含最佳时点+风险系数标注）；
+    2. 各组潜在风险柱状图（含误差影响）
+    """
+    # 子图1：首次达标时间分布+最佳时点+风险系数
+    plt.figure(figsize=(12, 6))
+    groups = best_time_df['BMI分组'].tolist()
+    data_box = [subject_df[subject_df['BMI_group']==g]['first_qualified_week'] for g in groups]
+    
+    # 绘制箱线图
+    box = plt.boxplot(data_box, labels=groups, patch_artist=True)
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'][:len(groups)]
+    for patch, color in zip(box['boxes'], colors):
+        patch.set_facecolor(color)
+    
+    # 标注C题关键线+最佳时点+风险系数
+    plt.axhline(y=12, color='green', ls='--', alpha=0.5, label='早期/中期分界（12周）')
+    plt.axhline(y=27, color='orange', ls='--', alpha=0.5, label='中期/晚期分界（27周）')
+    for i, row in best_time_df.iterrows():
+        # 标注最佳时点（星号）+风险系数（文本）
+        plt.scatter(i+1, row['最佳NIPT时点(周)'], color='black', s=100, marker='*', label='最佳时点' if i==0 else "")
+        plt.text(i+1.1, row['最佳NIPT时点(周)'], f'系数:{row["风险系数"]}', fontsize=9, color='red')
+    
+    plt.xlabel('BMI分组（C题临床分级）', fontsize=12)
+    plt.ylabel('首次达标时间（周）', fontsize=12)
+    plt.title('各BMI组首次达标时间分布+最佳时点+风险系数', fontsize=14)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig('达标时间_最佳时点.png', dpi=300)
+    plt.show()  # 强制显示图表1
+    
+    # 子图2：各组潜在风险对比（含误差影响）
+    plt.figure(figsize=(10, 6))
+    x = np.arange(len(groups))
+    width = 0.35
+    
+    # 原潜在风险+误差后潜在风险
+    orig_risk = best_time_df['潜在风险值'].values
+    error_risk = error_df['误差后潜在风险'].values if error_df is not None else orig_risk
+    
+    # 绘制柱状图
+    bars1 = plt.bar(x - width/2, orig_risk, width, label='原潜在风险', color='#2ca02c', alpha=0.8)
+    bars2 = plt.bar(x + width/2, error_risk, width, label='误差后潜在风险', color='#d62728', alpha=0.8)
+    
+    # 标注数值
+    for bar in bars1:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height, f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    for bar in bars2:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height, f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    plt.xlabel('BMI分组', fontsize=12)
+    plt.ylabel('潜在风险值（越低越好）', fontsize=12)
+    plt.title('各BMI组潜在风险对比（含检测误差影响）', fontsize=14)
+    plt.xticks(x, groups, rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('潜在风险对比.png', dpi=300)
+    plt.show()  # 强制显示图表2
+    
+    print("\n所有可视化图表已显示并保存（达标时间_最佳时点.png + 潜在风险对比.png）")
+
+
+# ------------------------------------------------------------------------------
+# 主函数（串联全流程）
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # 配置路径（需修改为你的csv路径）
+    CSV_PATH = "cleaned_data最终.csv"  # 已处理数据
+    
+    # 1. 数据加载
+    subject_df, male_df = load_preprocess_data(CSV_PATH)
+    
+    # 2. BMI分组
+    subject_df, valid_groups = bmi_clinical_grouping(subject_df)
+    
+    # 3. 计算最佳时点+风险系数+潜在风险
+    best_time_df = calculate_risk_and_best_time(subject_df, valid_groups)
+    
+    # 4. 检测误差分析
+    error_df, sigma = error_impact_analysis(male_df, best_time_df)
+    
+    # 5. 显示+保存所有可视化图表
+    visualize_all_results(subject_df, best_time_df, error_df)
+    
+    # 6. 保存结果表格
+    best_time_df.to_csv('最佳时点_风险系数结果.csv', index=False, encoding='utf-8-sig')
+    if not error_df.empty:
+        error_df.to_csv('检测误差影响结果.csv', index=False, encoding='utf-8-sig')
+    
+    print("\n=== 流程完成 ===")
+    print("输出文件：")
+    print("1. 表格：最佳时点_风险系数结果.csv、检测误差影响结果.csv")
+    print("2. 图表：达标时间_最佳时点.png、潜在风险对比.png（已显示）")
