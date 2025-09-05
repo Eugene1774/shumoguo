@@ -292,7 +292,7 @@ def evaluate_models(
     test_size: float = 0.2,
     random_state: int = 42,
     z_threshold: float = 3.0,
-    outputs_dir: str = "outputs"  
+    outputs_dir: str = "outputs"
 ) -> Tuple[Dict[str, Dict[str, float]], Tuple[str, Pipeline], Tuple[np.ndarray, np.ndarray]]:
     ensure_dir(outputs_dir)
 
