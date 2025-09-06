@@ -1,0 +1,363 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.cluster.hierarchy import dendrogram, linkage
+import matplotlib
+import re
+from scipy.interpolate import interp1d
+
+# 设置中文字体
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 读取数据
+df_male = pd.read_csv('cleaned_data最终(1).csv')
+
+
+# 转换孕周格式为数值
+def convert_week_to_numeric(week_str):
+    if pd.isna(week_str):
+        return np.nan
+    if isinstance(week_str, (int, float)):
+        return week_str
+
+    week_str = str(week_str).lower().replace('周', '').replace('w', '')
+    match = re.search(r'(\d+)(?:\+(\d+))?', week_str)
+    if match:
+        weeks = int(match.group(1))
+        days = int(match.group(2)) if match.group(2) else 0
+        return weeks + days / 7
+    return np.nan
+
+
+df_male['检测孕周数值'] = df_male['检测孕周'].apply(convert_week_to_numeric)
+
+# 关键修正：对每个孕妇找到最早达标时间
+print("处理每个孕妇的最早达标时间...")
+
+# 标记达标样本
+df_male['达标'] = df_male['Y染色体浓度'] >= 0.04
+
+# 对每个孕妇，找到最早达标的检测时间
+earliest_pass_df = df_male[df_male['达标']].groupby('孕妇代码').agg({
+    '检测孕周数值': 'min',
+    'Y染色体浓度': 'first',
+    '孕妇BMI': 'first',
+    '年龄': 'first',
+    '身高': 'first',
+    '体重': 'first'
+}).reset_index()
+
+earliest_pass_df.rename(columns={'检测孕周数值': '最早达标孕周'}, inplace=True)
+
+print(f"总孕妇数: {df_male['孕妇代码'].nunique()}")
+print(f"有达标记录的孕妇数: {len(earliest_pass_df)}")
+print(f"达标孕妇比例: {len(earliest_pass_df) / df_male['孕妇代码'].nunique() * 100:.1f}%")
+
+# 合并回原始数据，为每个孕妇添加最早达标时间
+df_male = df_male.merge(earliest_pass_df[['孕妇代码', '最早达标孕周']], on='孕妇代码', how='left')
+
+# 对于没有达标记录的孕妇，设置最早达标孕周为NaN
+df_male.loc[df_male['最早达标孕周'].isna(), '最早达标孕周'] = np.nan
+
+# 使用每个孕妇的第一条记录进行分析（避免重复）
+unique_patients = df_male.drop_duplicates('孕妇代码').copy()
+
+# 层次聚类BMI分组（基于唯一孕妇）
+bmi_data = unique_patients[['孕妇BMI']].dropna().values
+
+n_clusters = 4
+hierarchical = AgglomerativeClustering(n_clusters=n_clusters, metric='euclidean', linkage='ward')
+unique_patients['BMI分组'] = hierarchical.fit_predict(bmi_data)
+
+# 按平均BMI排序分组，确保分组按BMI值递增
+group_order = unique_patients.groupby('BMI分组')['孕妇BMI'].mean().sort_values().index
+group_mapping = {old: new for new, old in enumerate(group_order)}
+unique_patients['BMI分组'] = unique_patients['BMI分组'].map(group_mapping)
+
+# 定义临床分组名称
+clinical_group_names = {
+    0: "正常/超重",
+    1: "轻度肥胖",
+    2: "中度肥胖",
+    3: "重度肥胖"
+}
+unique_patients['BMI临床分组'] = unique_patients['BMI分组'].map(clinical_group_names)
+
+
+# 构建生存曲线函数（第二类风险：浓度不达标风险）
+def build_survival_curves(unique_patients):
+    """为每个BMI分组构建生存曲线（未达标概率曲线）"""
+    survival_curves = {}
+
+    for group_id in range(n_clusters):
+        group_data = unique_patients[unique_patients['BMI分组'] == group_id]
+        passed_data = group_data[~group_data['最早达标孕周'].isna()]
+
+        if len(passed_data) > 0:
+            # 创建时间序列
+            weeks = np.arange(10, 30, 0.5)
+            survival_prob = []
+
+            for week in weeks:
+                # 计算在week周时仍未达标的比例
+                not_passed_ratio = len(passed_data[passed_data['最早达标孕周'] > week]) / len(group_data)
+                survival_prob.append(not_passed_ratio)
+
+            # 创建插值函数
+            survival_func = interp1d(weeks, survival_prob, kind='linear',
+                                     bounds_error=False, fill_value=(1.0, 0.0))
+            survival_curves[group_id] = survival_func
+
+            # 绘制生存曲线
+            plt.figure(figsize=(10, 6))
+            plt.plot(weeks, survival_prob, 'b-', linewidth=2, label='未达标概率')
+            plt.xlabel('孕周')
+            plt.ylabel('未达标概率')
+            plt.title(f'BMI分组 {group_id + 1} ({clinical_group_names[group_id]}) - 生存曲线')
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.savefig(f'Q3-BMI分组{group_id + 1}_生存曲线.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+    return survival_curves
+
+
+# 构建生存曲线
+survival_curves = build_survival_curves(unique_patients)
+
+
+# 定义第一类风险函数（治疗窗口缩短风险）
+def treatment_window_risk(week):
+    """
+    第一类风险：治疗窗口缩短风险
+    基于临床实践，孕周越晚，治疗窗口越短，风险越高
+    """
+    if week <= 12:
+        return 0.25# 早期，风险很低
+    elif 12 < week <= 20:
+        return 0.5 + (week - 12) * 0.05  # 风险线性增加
+    elif 20 < week <= 24:
+        return 0.9+ (week - 20) * 0.1  # 风险快速增加
+    elif 24 < week <= 28:
+        return 1.3 + (week - 24) * 0.15  # 风险急剧增加
+    else:
+        return 2.0  # 极晚期，风险极高
+
+
+# 绘制第一类风险曲线（治疗窗口缩短风险）
+def plot_first_type_risk_curve():
+    # 生成孕周数据点（10到30周，间隔0.1周以确保曲线平滑）
+    weeks = np.linspace(10, 30, 200)
+    # 计算每个孕周对应的第一类风险值
+    risk1_values = [treatment_window_risk(week) for week in weeks]
+
+    # 创建画布
+    plt.figure(figsize=(12, 8))
+
+    # 绘制第一类风险曲线
+    plt.plot(weeks, risk1_values, 'r-', linewidth=3, label='第一类风险（治疗窗口缩短风险）')
+
+    # 添加风险阶段分隔线
+    stage_boundaries = [12, 20, 24, 28]
+    for boundary in stage_boundaries:
+        plt.axvline(x=boundary, color='gray', linestyle='--', alpha=0.7)
+
+    # 添加阶段标签
+    plt.text(11, 0.15, '≤12周', ha='center', va='center', backgroundcolor='white')
+    plt.text(16, 0.3, '12-20周', ha='center', va='center', backgroundcolor='white')
+    plt.text(22, 0.7, '20-24周', ha='center', va='center', backgroundcolor='white')
+    plt.text(26, 1.3, '24-28周', ha='center', va='center', backgroundcolor='white')
+    plt.text(29, 1.8, '>28周', ha='center', va='center', backgroundcolor='white')
+
+    # 设置坐标轴和标题
+    plt.xlabel('孕周', fontsize=14)
+    plt.ylabel('风险值', fontsize=14)
+    plt.title('第一类风险曲线：治疗窗口缩短风险随孕周变化', fontsize=16, pad=20)
+    plt.xlim(10, 30)
+    plt.ylim(0, 2.2)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=12)
+
+    # 保存图像
+    plt.savefig('Q3-第一类风险曲线.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("第一类风险曲线已保存为：Q3-第一类风险曲线.png")
+
+
+# 调用函数生成第一类风险曲线
+plot_first_type_risk_curve()
+
+# -------------------------- 核心修改：第二类风险权重函数 --------------------------
+# 改为：BMI<25时权重固定为1.0（正常值），BMI≥25后权重与BMI呈线性递增
+def failure_risk_weight(bmi):
+    """
+    第二类风险权重：浓度不达标的风险权重
+    逻辑：BMI<25（正常）权重固定1.0；BMI≥25后，权重随BMI线性递增（斜率0.08，确保风险增长合理）
+    公式：weight = 1.0 + 0.08 * (bmi - 25) （当bmi≥25时）
+    """
+    if bmi < 25:
+        return 1.0  # BMI正常范围，权重固定（无额外风险）
+    else:
+        # BMI≥25后线性递增：斜率0.08（可根据需求调整，斜率越大权重增长越快）
+        # 示例：BMI=25→1.0，BMI=30→1.4，BMI=35→1.8，BMI=40→2.2，BMI=45→2.6（符合临床风险趋势）
+        return 1.0 + 0.15 * (bmi - 25)
+
+
+
+# 综合风险计算函数
+def combined_risk(week, bmi, group_id, survival_curves):
+    """
+    计算综合风险 = 第一类风险 + 第二类风险 × 权重
+    """
+    # 第一类风险：治疗窗口缩短风险
+    risk1 = treatment_window_risk(week)
+
+    # 第二类风险：浓度不达标风险（从生存曲线获取）
+    if group_id in survival_curves:
+        risk2_prob = survival_curves[group_id](week)
+    else:
+        risk2_prob = 1.0  # 默认高风险
+
+    # 第二类风险权重
+    weight = failure_risk_weight(bmi)
+
+    # 综合风险
+    total_risk = risk1 + risk2_prob * weight
+
+    return total_risk, risk1, risk2_prob, weight
+
+
+# 为每个分组寻找最优检测时点
+def find_optimal_weeks(unique_patients, survival_curves):
+    """为每个BMI分组寻找风险最小的最优检测时点"""
+    optimal_weeks = {}
+
+    for group_id in range(n_clusters):
+        group_data = unique_patients[unique_patients['BMI分组'] == group_id]
+        if len(group_data) == 0:
+            continue
+
+        avg_bmi = group_data['孕妇BMI'].mean()
+        group_name = clinical_group_names[group_id]
+
+        # 在10-28周范围内搜索最优时点
+        weeks = np.linspace(10, 28, 100)
+        risks = []
+        risk1_values = []
+        risk2_values = []
+
+        for week in weeks:
+            total_risk, risk1, risk2_prob, weight = combined_risk(week, avg_bmi, group_id, survival_curves)
+            risks.append(total_risk)
+            risk1_values.append(risk1)
+            risk2_values.append(risk2_prob * weight)
+
+        # 找到风险最小的时点
+        min_risk_idx = np.argmin(risks)
+        optimal_week = weeks[min_risk_idx]
+        min_risk = risks[min_risk_idx]
+
+        optimal_weeks[group_id] = {
+            'optimal_week': optimal_week,
+            'min_risk': min_risk,
+            'risk1_at_optimal': risk1_values[min_risk_idx],
+            'risk2_at_optimal': risk2_values[min_risk_idx],
+            'group_name': group_name,
+            'avg_bmi': avg_bmi
+        }
+
+        # 绘制风险曲线
+        plt.figure(figsize=(12, 8))
+        plt.plot(weeks, risks, 'b-', linewidth=3, label='综合风险')
+        plt.plot(weeks, risk1_values, 'r--', linewidth=2, label='治疗窗口风险(第一类)')
+        plt.plot(weeks, risk2_values, 'g--', linewidth=2, label='检测失败风险(第二类)')
+        plt.axvline(x=optimal_week, color='k', linestyle=':', label=f'最优时点: {optimal_week:.1f}周')
+        plt.xlabel('检测孕周')
+        plt.ylabel('风险值')
+        plt.title(f'BMI分组 {group_id + 1} ({group_name}) - 风险曲线\n平均BMI: {avg_bmi:.1f}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(f'Q3-BMI分组{group_id + 1}_风险曲线.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    return optimal_weeks
+
+
+# 寻找最优检测时点
+optimal_weeks = find_optimal_weeks(unique_patients, survival_curves)
+
+# 输出结果
+print("=" * 100)
+print("基于两类风险综合评估的最优NIPT检测时点建议")
+print("=" * 100)
+print("风险说明:")
+print("- 第一类风险: 治疗窗口缩短风险 (孕周越晚风险越高)")
+print("- 第二类风险: 浓度不达标风险 × BMI权重 (BMI越高权重越大)")
+print("- 综合风险 = 第一类风险 + 第二类风险")
+print()
+
+for group_id, result in optimal_weeks.items():
+    group_data = unique_patients[unique_patients['BMI分组'] == group_id]
+    bmi_min = group_data['孕妇BMI'].min()
+    bmi_max = group_data['孕妇BMI'].max()
+    total_patients = len(group_data)
+
+    print(f"BMI分组 {group_id + 1} ({result['group_name']}, BMI范围: {bmi_min:.1f}-{bmi_max:.1f}):")
+    print(f"  推荐检测孕周: {result['optimal_week']:.1f} 周")
+    print(f"  最小综合风险值: {result['min_risk']:.3f}")
+    print(f"  第一类风险(治疗窗口): {result['risk1_at_optimal']:.3f}")
+    print(f"  第二类风险(检测失败): {result['risk2_at_optimal']:.3f}")
+
+    # 临床建议
+    if result['min_risk'] < 1.0:
+        risk_level = "低风险"
+        suggestion = "常规检测流程，成功率较高"
+    elif result['min_risk'] < 2.0:
+        risk_level = "中风险"
+        suggestion = "建议提前准备，检测后密切跟踪结果"
+    elif result['min_risk'] < 3.0:
+        risk_level = "高风险"
+        suggestion = "需要特殊准备，建议结合其他检测手段"
+    else:
+        risk_level = "极高风险"
+        suggestion = "强烈建议采用替代检测方案"
+
+    print(f"  风险等级: {risk_level}")
+    print(f"  💡 临床建议: {suggestion}")
+    print("-" * 100)
+
+# 绘制所有分组的风险曲线对比
+plt.figure(figsize=(14, 8))
+weeks = np.linspace(10, 28, 100)
+
+for group_id in range(n_clusters):
+    if group_id in optimal_weeks:
+        group_data = unique_patients[unique_patients['BMI分组'] == group_id]
+        avg_bmi = group_data['孕妇BMI'].mean()
+
+        risks = []
+        for week in weeks:
+            total_risk, _, _, _ = combined_risk(week, avg_bmi, group_id, survival_curves)
+            risks.append(total_risk)
+
+        plt.plot(weeks, risks, label=f'分组{group_id + 1}({clinical_group_names[group_id]}, BMI:{avg_bmi:.1f})',
+                 linewidth=2)
+
+plt.xlabel('检测孕周')
+plt.ylabel('综合风险值')
+plt.title('各BMI分组的综合风险曲线对比')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+plt.savefig('Q3-所有分组风险曲线对比.png', dpi=300, bbox_inches='tight')
+plt.close()
+
+print("\n所有图表已保存完毕！")
+print("文件名说明:")
+print("- Q3-BMI分组X_生存曲线.png: 各分组的未达标概率曲线")
+print("- Q3-BMI分组X_风险曲线.png: 各分组的风险分解曲线")
+print("- Q3-所有分组风险曲线对比.png: 所有分组的风险对比")
