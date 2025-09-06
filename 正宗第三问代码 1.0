@@ -1,0 +1,653 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.cluster.hierarchy import dendrogram, linkage
+import matplotlib
+import re
+from scipy.interpolate import interp1d
+from scipy.stats import norm, pearsonr
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# 读取数据
+df_male = pd.read_csv('cleaned_data最终(1).csv')
+
+
+# 转换孕周格式为数值
+def convert_week_to_numeric(week_str):
+    if pd.isna(week_str):
+        return np.nan
+    if isinstance(week_str, (int, float)):
+        return week_str
+
+    week_str = str(week_str).lower().replace('周', '').replace('w', '')
+    match = re.search(r'(\d+)(?:\+(\d+))?', week_str)
+    if match:
+        weeks = int(match.group(1))
+        days = int(match.group(2)) if match.group(2) else 0
+        return weeks + days / 7
+    return np.nan
+
+
+df_male['检测孕周数值'] = df_male['检测孕周'].apply(convert_week_to_numeric)
+
+# 标记达标样本
+df_male['达标'] = df_male['Y染色体浓度'] >= 0.04
+
+# 对每个孕妇，找到最早达标的检测时间
+earliest_pass_df = df_male[df_male['达标']].groupby('孕妇代码').agg({
+    '检测孕周数值': 'min',
+    'Y染色体浓度': 'first',
+    '孕妇BMI': 'first',
+    '年龄': 'first',
+    '身高': 'first',
+    '体重': 'first',
+    'GC含量': 'first',
+    '被过滤掉读段数的比例': 'first',
+    'X染色体浓度': 'first',
+    '检测抽血次数': 'first',
+    '原始读段数': 'first',
+    '18号染色体的Z值': 'first'
+}).reset_index()
+
+earliest_pass_df.rename(columns={'检测孕周数值': '最早达标孕周'}, inplace=True)
+
+print(f"总孕妇数: {df_male['孕妇代码'].nunique()}")
+print(f"有达标记录的孕妇数: {len(earliest_pass_df)}")
+print(f"达标孕妇比例: {len(earliest_pass_df) / df_male['孕妇代码'].nunique() * 100:.1f}%")
+
+# 合并回原始数据，为每个孕妇添加最早达标时间
+df_male = df_male.merge(earliest_pass_df[['孕妇代码', '最早达标孕周']], on='孕妇代码', how='left')
+
+# 对于没有达标记录的孕妇，设置最早达标孕周为NaN
+df_male.loc[df_male['最早达标孕周'].isna(), '最早达标孕周'] = np.nan
+
+# 使用每个孕妇的第一条记录进行分析（避免重复）
+unique_patients = df_male.drop_duplicates('孕妇代码').copy()
+
+# 分析各变量与Y染色体浓度的相关性
+correlation_vars = ['年龄', '身高', 'GC含量', 'X染色体浓度', '检测抽血次数', '原始读段数', '18号染色体的Z值']
+correlation_results = {}
+
+for var in correlation_vars:
+    if var in df_male.columns and not df_male[var].isna().all() and not df_male['Y染色体浓度'].isna().all():
+        # 过滤NaN值后计算相关性
+        valid_data = df_male[[var, 'Y染色体浓度']].dropna()
+        if len(valid_data) > 2:  # 至少3个有效数据点才计算相关性
+            corr, p_value = pearsonr(valid_data[var], valid_data['Y染色体浓度'])
+            correlation_results[var] = {'correlation': corr, 'p_value': p_value}
+            print(f"{var} 与Y染色体浓度的相关性: {corr:.3f} (p={p_value:.3e})")
+        else:
+            print(f"{var} 有效数据点不足，无法计算相关性")
+    else:
+        print(f"{var} 列不存在或数据全为NaN，无法计算相关性")
+
+# 基于相关性分析分配风险系数
+# 正相关变量会降低风险（正系数），负相关变量会增加风险（负系数）
+risk_coefficients = {
+    '年龄': -0.1,  # 年龄与Y染色体浓度负相关→增加风险
+    '身高': 0.05,  # 身高与Y染色体浓度正相关→降低风险
+    'GC含量': 0.08,  # GC含量与Y染色体浓度正相关→降低风险
+    'X染色体浓度': -0.15,  # X染色体浓度与Y染色体浓度负相关→增加风险
+    '检测抽血次数': -0.05,  # 检测抽血次数与Y染色体浓度负相关→增加风险
+    '原始读段数': 0.1,  # 原始读段数与Y染色体浓度正相关→降低风险
+    '18号染色体的Z值': -0.07  # 18号染色体Z值与Y染色体浓度负相关→增加风险
+}
+
+# 准备数据用于预测最早达标时间
+# 只使用有达标记录的样本
+train_data = earliest_pass_df[
+    ['孕妇BMI', '年龄', '身高', '体重', 'GC含量', '被过滤掉读段数的比例',
+     'X染色体浓度', '检测抽血次数', '原始读段数', '18号染色体的Z值', '最早达标孕周']].dropna()
+
+# 特征和目标变量
+if len(train_data) > 0:
+    X = train_data[['孕妇BMI', '年龄', '身高', '体重', 'GC含量', '被过滤掉读段数的比例',
+                    'X染色体浓度', '检测抽血次数', '原始读段数', '18号染色体的Z值']]
+    y = train_data['最早达标孕周']
+
+    # 标准化特征
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # 训练随机森林回归模型预测最早达标时间
+    rf_regressor = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=5)
+    rf_regressor.fit(X_scaled, y)
+
+    # 交叉验证评估模型
+    cv_scores = cross_val_score(rf_regressor, X_scaled, y, cv=5, scoring='r2')
+    print(f"随机森林回归模型R²分数: {np.mean(cv_scores):.3f} (±{np.std(cv_scores):.3f})")
+
+    # 特征重要性
+    feature_importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': rf_regressor.feature_importances_
+    }).sort_values('importance', ascending=False)
+
+    print("\n特征重要性:")
+    print(feature_importance)
+
+    # 为所有孕妇预测最早达标时间
+    prediction_data = unique_patients[['孕妇BMI', '年龄', '身高', '体重', 'GC含量', '被过滤掉读段数的比例',
+                                       'X染色体浓度', '检测抽血次数', '原始读段数', '18号染色体的Z值']].copy()
+    # 用中位数填充缺失值
+    prediction_data_filled = prediction_data.fillna(prediction_data.median())
+    prediction_data_scaled = scaler.transform(prediction_data_filled)
+    unique_patients['预测最早达标孕周'] = rf_regressor.predict(prediction_data_scaled)
+
+    # 对于有实际达标时间的，使用实际值；没有的，使用预测值
+    unique_patients['最终最早达标孕周'] = unique_patients['最早达标孕周'].fillna(unique_patients['预测最早达标孕周'])
+else:
+    print("⚠️  有效训练数据不足，无法训练预测模型，直接使用原始达标时间")
+    unique_patients['最终最早达标孕周'] = unique_patients['最早达标孕周']
+
+# 检测误差模型 - 估计Y染色体浓度的测量误差
+# 计算同一孕妇多次检测的标准差作为测量误差的估计
+measurement_errors = df_male.groupby('孕妇代码')['Y染色体浓度'].std().dropna()
+avg_measurement_error = measurement_errors.mean() if not measurement_errors.empty else 0.01  # 默认1%的误差
+
+print(f"\nY染色体浓度平均测量误差: {avg_measurement_error:.4f}")
+
+# 使用更精细的BMI分组（基于百分位数）
+valid_bmi = unique_patients['孕妇BMI'].dropna()
+if len(valid_bmi) > 0:
+    bmi_percentiles = np.percentile(valid_bmi, [0, 25, 50, 75, 100])
+    # 避免百分位数重复（如所有BMI相同）
+    bmi_percentiles = np.unique(bmi_percentiles)
+    # 确保分组数为4（若有重复则调整）
+    if len(bmi_percentiles) < 4:
+        bmi_percentiles = np.linspace(valid_bmi.min(), valid_bmi.max(), 5)
+    bmi_labels = ['偏瘦', '正常', '超重', '肥胖']
+
+    unique_patients['BMI分组'] = pd.cut(
+        unique_patients['孕妇BMI'],
+        bins=bmi_percentiles,
+        labels=bmi_labels[:len(bmi_percentiles) - 1],  # 适配实际分箱数
+        include_lowest=True
+    )
+else:
+    print("⚠️  无有效BMI数据，无法分组")
+    bmi_labels = []
+    unique_patients['BMI分组'] = np.nan
+
+# 定义临床分组名称
+clinical_group_names = {}
+if len(bmi_labels) > 0 and 'BMI分组' in unique_patients.columns:
+    for i, label in enumerate(bmi_labels):
+        if i < len(bmi_percentiles) - 1:
+            if i == 0:
+                clinical_group_names[label] = f"偏瘦 (BMI < {bmi_percentiles[1]:.1f})"
+            elif i == 1:
+                clinical_group_names[label] = f"正常 ({bmi_percentiles[1]:.1f} ≤ BMI < {bmi_percentiles[2]:.1f})"
+            elif i == 2:
+                clinical_group_names[label] = f"超重 ({bmi_percentiles[2]:.1f} ≤ BMI < {bmi_percentiles[3]:.1f})"
+            elif i == 3:
+                clinical_group_names[label] = f"肥胖 (BMI ≥ {bmi_percentiles[3]:.1f})"
+
+
+# 构建考虑检测误差的生存曲线函数
+def build_survival_curves_with_error(unique_patients, measurement_error):
+    """为每个BMI分组构建考虑检测误差的生存曲线（未达标概率曲线）"""
+    survival_curves = {}
+    n_simulations = 1000  # 蒙特卡洛模拟次数
+
+    if 'BMI分组' not in unique_patients.columns:
+        return survival_curves
+
+    for group_name in unique_patients['BMI分组'].cat.categories:
+        group_data = unique_patients[unique_patients['BMI分组'] == group_name]
+        if len(group_data) == 0 or group_data['最终最早达标孕周'].isna().all():
+            continue
+
+        # 创建时间序列
+        weeks = np.arange(10, 30, 0.5)
+        survival_prob = []
+
+        for week in weeks:
+            # 蒙特卡洛模拟考虑检测误差
+            not_passed_count = 0
+
+            for _, patient in group_data.iterrows():
+                predicted_week = patient['最终最早达标孕周']
+                if pd.isna(predicted_week):
+                    continue
+
+                # 考虑检测误差：实际达标时间可能比预测的早或晚
+                # 使用正态分布模拟检测误差
+                error_weeks = np.random.normal(0, measurement_error * 2, n_simulations)  # 误差放大因子
+                simulated_weeks = predicted_week + error_weeks
+
+                # 计算在week周时仍未达标的比例
+                not_passed = np.sum(simulated_weeks > week) / n_simulations
+                not_passed_count += not_passed
+
+            survival_prob.append(not_passed_count / len(group_data))
+
+        # 创建插值函数
+        survival_func = interp1d(weeks, survival_prob, kind='linear',
+                                 bounds_error=False, fill_value=(1.0, 0.0))
+        survival_curves[group_name] = survival_func
+
+        # 绘制生存曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(weeks, survival_prob, 'b-', linewidth=2, label='未达标概率')
+        plt.xlabel('孕周')
+        plt.ylabel('未达标概率')
+        plt.title(f'BMI分组 {group_name} - 考虑检测误差的生存曲线')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig(f'Q3-BMI分组{group_name}_考虑误差的生存曲线.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    return survival_curves
+
+
+# 构建考虑检测误差的生存曲线
+survival_curves = build_survival_curves_with_error(unique_patients, avg_measurement_error)
+
+
+# 定义第一类风险函数（治疗窗口缩短风险）
+def treatment_window_risk(week):
+    """
+    第一类风险：治疗窗口缩短风险
+    基于临床实践，孕周越晚，治疗窗口越短，风险越高
+    """
+    if week <= 12:
+        return 0.25  # 早期，风险很低
+    elif 12 < week <= 20:
+        return 0.5 + (week - 12) * 0.05  # 风险线性增加
+    elif 20 < week <= 24:
+        return 0.9 + (week - 20) * 0.1  # 风险快速增加
+    elif 24 < week <= 28:
+        return 1.3 + (week - 24) * 0.15  # 风险急剧增加
+    else:
+        return 2.0  # 极晚期，风险极高
+
+
+# 第二类风险权重函数 - 更新版本，包含所有变量
+def failure_risk_weight(patient_data):
+    """
+    第二类风险权重：浓度不达标的风险权重
+    综合考虑BMI、年龄、身高、GC含量、X染色体浓度、检测抽血次数、原始读段数、18号染色体Z值
+    """
+    # 基础BMI权重
+    bmi = patient_data['孕妇BMI']
+    bmi_weight = 1.0
+    if bmi >= 25:
+        bmi_weight = 1.0 + 0.2 * (bmi - 25)
+
+    # 年龄权重（年龄越大风险越高）
+    age = patient_data['年龄']
+    age_weight = 1.0 + 0.05 * max(0, age - 30)
+
+    # 过滤读数比例权重（过滤比例越高，数据质量越差，风险越高）
+    filtered_ratio = patient_data['被过滤掉读段数的比例']
+    filtered_weight = 1.0 + 2.0 * filtered_ratio
+
+    # 基础权重
+    base_weight = bmi_weight * age_weight * filtered_weight
+
+    # 新增变量的风险调整
+    additional_risk = 0
+
+    # 身高风险调整
+    height = patient_data.get('身高', np.nan)
+    if not pd.isna(height):
+        additional_risk += risk_coefficients.get('身高', 0) * (height - 140) / 5 # 以140cm为基准，每5cm调整
+
+    # GC含量风险调整
+    gc_content = patient_data.get('GC含量', np.nan)
+    if not pd.isna(gc_content):
+        additional_risk += risk_coefficients.get('GC含量', 0) * (gc_content - 0.4) / 0.05  # 以0.4为基准，每0.05调整
+
+    # X染色体浓度风险调整
+    x_concentration = patient_data.get('X染色体浓度', np.nan)
+    if not pd.isna(x_concentration):
+        additional_risk += risk_coefficients.get('X染色体浓度', 0) * (x_concentration - 0.05) / 0.02  # 以0.05为基准，每0.02调整
+
+    # 检测抽血次数风险调整
+    blood_test_count = patient_data.get('检测抽血次数', np.nan)
+    if not pd.isna(blood_test_count):
+        additional_risk += risk_coefficients.get('检测抽血次数', 0) * (blood_test_count - 1)  # 以1次为基准
+
+    # 原始读段数风险调整
+    raw_reads = patient_data.get('原始读段数', np.nan)
+    if not pd.isna(raw_reads):
+        additional_risk += risk_coefficients.get('原始读段数', 0) * (raw_reads - 4000000) / 1000000  # 以400万为基准，每100万调整
+
+    # 18号染色体Z值风险调整
+    z_18 = patient_data.get('18号染色体的Z值', np.nan)
+    if not pd.isna(z_18):
+        additional_risk += risk_coefficients.get('18号染色体的Z值', 0) * z_18  # 直接使用Z值
+
+    # 综合权重
+    total_weight = base_weight * (1 + additional_risk)
+
+    return max(total_weight, 0.1)  # 确保权重不低于0.1
+
+
+# ==============================================================================
+# 新增：整理变量权重系数数据，用于可视化
+# ==============================================================================
+def get_weight_coefficients_data():
+    """整理所有参与权重计算的变量及其系数，区分基础权重和风险调整系数"""
+    # 1. 基础权重变量（直接影响权重倍数）
+    base_weight_vars = [
+        {'变量名称': 'BMI（≥25时）', '系数': 0.15, '影响方向': '增加风险', '说明': 'BMI≥25时，每增加1单位，权重+0.15'},
+        {'变量名称': '年龄（>30岁）', '系数': 0.01, '影响方向': '增加风险', '说明': '年龄>30岁时，每增加1岁，权重+0.01'},
+        {'变量名称': '被过滤读段比例', '系数': 2.0, '影响方向': '增加风险',
+         '说明': '过滤比例每增加1单位，权重×(1+2.0×比例)'},
+    ]
+
+    # 2. 风险调整变量（通过additional_risk影响权重，系数来自risk_coefficients）
+    risk_adjust_vars = [
+        {'变量名称': '身高', '系数': risk_coefficients['身高'], '影响方向': '降低风险',
+         '说明': '身高每高于160cm 10cm，风险调整-0.05'},
+        {'变量名称': 'GC含量', '系数': risk_coefficients['GC含量'], '影响方向': '降低风险',
+         '说明': 'GC含量每高于0.4 0.05，风险调整-0.08'},
+        {'变量名称': 'X染色体浓度', '系数': risk_coefficients['X染色体浓度'], '影响方向': '增加风险',
+         '说明': 'X浓度每高于0.05 0.02，风险调整+0.15'},
+        {'变量名称': '检测抽血次数', '系数': risk_coefficients['检测抽血次数'], '影响方向': '增加风险',
+         '说明': '抽血次数每多1次，风险调整+0.05'},
+        {'变量名称': '原始读段数', '系数': risk_coefficients['原始读段数'], '影响方向': '降低风险',
+         '说明': '读段数每高于400万100万，风险调整-0.1'},
+        {'变量名称': '18号染色体Z值', '系数': risk_coefficients['18号染色体的Z值'], '影响方向': '增加风险',
+         '说明': 'Z值每增加1，风险调整+0.07'},
+    ]
+
+    # 合并两类变量，添加统一标识
+    all_vars = base_weight_vars + risk_adjust_vars
+    for var in all_vars:
+        var['系数绝对值'] = abs(var['系数'])  # 用于排序
+    return pd.DataFrame(all_vars)
+
+
+# 获取权重系数数据
+weight_coef_df = get_weight_coefficients_data()
+
+
+# ==============================================================================
+# 新增：绘制变量权重系数条形图
+# ==============================================================================
+def plot_weight_coefficients(weight_coef_df):
+    """绘制变量权重系数图，区分增加/降低风险，标注系数和说明"""
+    # 设置图形大小和风格
+    plt.figure(figsize=(14, 10))
+    # 按系数绝对值排序，让影响大的变量在上方
+    weight_coef_df_sorted = weight_coef_df.sort_values('系数绝对值', ascending=True)
+
+    # 定义颜色：增加风险=红色，降低风险=绿色
+    colors = ['#FF6B6B' if x == '增加风险' else '#4ECDC4' for x in weight_coef_df_sorted['影响方向']]
+
+    # 绘制水平条形图
+    bars = plt.barh(
+        y=weight_coef_df_sorted['变量名称'],
+        width=weight_coef_df_sorted['系数'],
+        color=colors,
+        alpha=0.8,
+        edgecolor='black',
+        linewidth=0.5
+    )
+
+    # 为每个条形标注系数值（保留3位小数）
+    for i, (bar, coef) in enumerate(zip(bars, weight_coef_df_sorted['系数'])):
+        width = bar.get_width()
+        # 系数为正时，标签在条形右侧；为负时在左侧
+        x_pos = width + 0.02 if width > 0 else width - 0.02
+        plt.text(
+            x=x_pos,
+            y=bar.get_y() + bar.get_height() / 2,
+            s=f'系数: {coef:.3f}',
+            va='center',
+            ha='left' if width > 0 else 'right',
+            fontsize=10,
+            fontweight='bold'
+        )
+
+    # 添加垂直零线（区分正负数）
+    plt.axvline(x=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+
+    # 设置坐标轴和标题
+    plt.xlabel('权重系数（正值=降低风险，负值=增加风险）', fontsize=12, fontweight='bold')
+    plt.ylabel('变量名称', fontsize=12, fontweight='bold')
+    plt.title('各变量对NIPT检测风险权重的影响系数', fontsize=16, fontweight='bold', pad=20)
+
+    # 添加图例
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#FF6B6B', alpha=0.8, label='增加风险'),
+        Patch(facecolor='#4ECDC4', alpha=0.8, label='降低风险')
+    ]
+    plt.legend(handles=legend_elements, loc='lower right', fontsize=10)
+
+    # 添加注释说明特殊变量规则
+    annotation_text = (
+        '特殊规则说明：\n'
+        '1. BMI：≤25时基础权重=1.0，≥25时按系数0.15递增\n'
+        '2. 年龄：≤30岁时基础权重=1.0，>30岁时按系数0.01递增\n'
+        '3. 被过滤读段比例：权重=1.0 + 2.0×比例（比例范围0-1）'
+    )
+    plt.text(
+        0.02, 0.02,
+        annotation_text,
+        transform=plt.gca().transAxes,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.8),
+        fontsize=9,
+        verticalalignment='bottom'
+    )
+
+    # 调整布局，避免标签被截断
+    plt.tight_layout()
+    # 保存图片
+    plt.savefig('Q3-各变量风险权重系数图.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("\n✅ 变量权重系数图已保存：Q3-各变量风险权重系数图.png")
+
+
+# 调用函数绘制权重系数图
+plot_weight_coefficients(weight_coef_df)
+
+
+# ==============================================================================
+# 综合风险计算函数（原有代码保留）
+# ==============================================================================
+def combined_risk(week, patient_data, group_name, survival_curves):
+    """
+    计算综合风险 = 第一类风险 + 第二类风险 × 权重
+    """
+    # 第一类风险：治疗窗口缩短风险
+    risk1 = treatment_window_risk(week)
+
+    # 第二类风险：浓度不达标风险（从生存曲线获取）
+    risk2_prob = survival_curves.get(group_name, lambda x: 1.0)(week)
+
+    # 第二类风险权重
+    weight = failure_risk_weight(patient_data)
+
+    # 综合风险
+    total_risk = risk1 + risk2_prob * weight
+
+    return total_risk, risk1, risk2_prob, weight
+
+
+# 为每个分组寻找最优检测时点（原有代码保留，适配分组可能为空的情况）
+def find_optimal_weeks(unique_patients, survival_curves):
+    """为每个BMI分组寻找风险最小的最优检测时点"""
+    optimal_weeks = {}
+    if 'BMI分组' not in unique_patients.columns:
+        return optimal_weeks
+
+    for group_name in unique_patients['BMI分组'].cat.categories:
+        group_data = unique_patients[unique_patients['BMI分组'] == group_name]
+        if len(group_data) == 0 or group_data[['孕妇BMI', '年龄', '被过滤掉读段数的比例']].isna().all().all():
+            continue
+
+        # 计算组内平均特征值（填充NaN）
+        avg_patient = {
+            '孕妇BMI': group_data['孕妇BMI'].mean(),
+            '年龄': group_data['年龄'].mean(),
+            '被过滤掉读段数的比例': group_data['被过滤掉读段数的比例'].mean(),
+            '身高': group_data['身高'].mean() if not group_data['身高'].isna().all() else 160,
+            'GC含量': group_data['GC含量'].mean() if not group_data['GC含量'].isna().all() else 0.4,
+            'X染色体浓度': group_data['X染色体浓度'].mean() if not group_data['X染色体浓度'].isna().all() else 0.05,
+            '检测抽血次数': group_data['检测抽血次数'].mean() if not group_data['检测抽血次数'].isna().all() else 1,
+            '原始读段数': group_data['原始读段数'].mean() if not group_data['原始读段数'].isna().all() else 4000000,
+            '18号染色体的Z值': group_data['18号染色体的Z值'].mean() if not group_data[
+                '18号染色体的Z值'].isna().all() else 0
+        }
+
+        # 在10-28周范围内搜索最优时点
+        weeks = np.linspace(10, 28, 100)
+        risks = []
+        risk1_values = []
+        risk2_values = []
+
+        for week in weeks:
+            total_risk, risk1, risk2_prob, weight = combined_risk(week, avg_patient, group_name, survival_curves)
+            risks.append(total_risk)
+            risk1_values.append(risk1)
+            risk2_values.append(risk2_prob * weight)
+
+        # 找到风险最小的时点
+        if risks:
+            min_risk_idx = np.argmin(risks)
+            optimal_week = weeks[min_risk_idx]
+            min_risk = risks[min_risk_idx]
+
+            optimal_weeks[group_name] = {
+                'optimal_week': optimal_week,
+                'min_risk': min_risk,
+                'risk1_at_optimal': risk1_values[min_risk_idx],
+                'risk2_at_optimal': risk2_values[min_risk_idx],
+                'group_name': group_name,
+                'avg_patient': avg_patient
+            }
+
+            # 绘制风险曲线
+            plt.figure(figsize=(12, 8))
+            plt.plot(weeks, risks, 'b-', linewidth=3, label='综合风险')
+            plt.plot(weeks, risk1_values, 'r--', linewidth=2, label='治疗窗口风险(第一类)')
+            plt.plot(weeks, risk2_values, 'g--', linewidth=2, label='浓度不达标风险(第二类)')
+            plt.axvline(x=optimal_week, color='k', linestyle=':', label=f'最优时点: {optimal_week:.1f}周')
+            plt.xlabel('检测孕周')
+            plt.ylabel('风险值')
+            plt.title(
+                f'BMI分组 {group_name} - 风险曲线\n平均BMI: {avg_patient["孕妇BMI"]:.1f}, 平均年龄: {avg_patient["年龄"]:.1f}')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig(f'Q3-BMI分组{group_name}_风险曲线.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+    return optimal_weeks
+
+
+# 寻找最优检测时点
+optimal_weeks = find_optimal_weeks(unique_patients, survival_curves)
+
+# 输出结果（原有代码保留，适配分组可能为空的情况）
+print("\n" + "=" * 100)
+print("基于多因素和检测误差评估的最优NIPT检测时点建议")
+print("=" * 100)
+print("风险说明:")
+print("- 第一类风险: 治疗窗口缩短风险 (孕周越晚风险越高)")
+print(
+    "- 第二类风险: 浓度不达标风险 × 综合权重 (考虑BMI、年龄、身高、GC含量、X染色体浓度、检测抽血次数、原始读段数、18号染色体Z值)")
+print("- 综合风险 = 第一类风险 + 第二类风险")
+print(f"- 检测误差水平: {avg_measurement_error:.4f}")
+print()
+
+if optimal_weeks:
+    for group_name, result in optimal_weeks.items():
+        group_data = unique_patients[unique_patients['BMI分组'] == group_name]
+        bmi_min = group_data['孕妇BMI'].min() if not group_data['孕妇BMI'].isna().all() else np.nan
+        bmi_max = group_data['孕妇BMI'].max() if not group_data['孕妇BMI'].isna().all() else np.nan
+        total_patients = len(group_data)
+
+        print(
+            f"BMI分组: {clinical_group_names.get(group_name, group_name)}, BMI范围: {bmi_min:.1f}-{bmi_max:.1f}" if not pd.isna(
+                bmi_min) else f"BMI分组: {group_name}")
+        print(f"  孕妇数量: {total_patients}")
+        print(f"  平均年龄: {result['avg_patient']['年龄']:.1f}岁")
+        print(f"  平均身高: {result['avg_patient']['身高']:.1f}cm")
+        print(f"  平均GC含量: {result['avg_patient']['GC含量']:.3f}")
+        print(f"  平均X染色体浓度: {result['avg_patient']['X染色体浓度']:.3f}")
+        print(f"  平均检测抽血次数: {result['avg_patient']['检测抽血次数']:.1f}")
+        print(f"  平均原始读段数: {result['avg_patient']['原始读段数']:.0f}")
+        print(f"  平均18号染色体Z值: {result['avg_patient']['18号染色体的Z值']:.2f}")
+        print(f"  推荐检测孕周: {result['optimal_week']:.1f} 周")
+        print(f"  最小综合风险值: {result['min_risk']:.3f}")
+        print(f"  第一类风险(治疗窗口): {result['risk1_at_optimal']:.3f}")
+        print(f"  第二类风险(检测失败): {result['risk2_at_optimal']:.3f}")
+
+        # 临床建议
+        if result['min_risk'] < 1.0:
+            risk_level = "低风险"
+            suggestion = "常规检测流程，成功率较高"
+        elif result['min_risk'] < 2.0:
+            risk_level = "中风险"
+            suggestion = "建议提前准备，检测后密切跟踪结果"
+        elif result['min_risk'] < 3.0:
+            risk_level = "高风险"
+            suggestion = "需要特殊准备，建议结合其他检测手段"
+        else:
+            risk_level = "极高风险"
+            suggestion = "强烈建议采用替代检测方案"
+
+        print(f"  风险等级: {risk_level}")
+        print(f"  💡 临床建议: {suggestion}")
+        print("-" * 100)
+else:
+    print("⚠️  无有效BMI分组数据，无法输出最优检测时点建议")
+
+# 绘制所有分组的风险曲线对比（原有代码保留，适配分组可能为空的情况）
+if optimal_weeks and len(optimal_weeks) > 0:
+    plt.figure(figsize=(14, 8))
+    weeks = np.linspace(10, 28, 100)
+
+    for group_name in optimal_weeks.keys():
+        avg_patient = optimal_weeks[group_name]['avg_patient']
+        risks = []
+        for week in weeks:
+            total_risk, _, _, _ = combined_risk(week, avg_patient, group_name, survival_curves)
+            risks.append(total_risk)
+
+        label = f'{group_name}(BMI:{avg_patient["孕妇BMI"]:.1f},年龄:{avg_patient["年龄"]:.1f})'
+        plt.plot(weeks, risks, label=label, linewidth=2)
+
+    plt.xlabel('检测孕周')
+    plt.ylabel('综合风险值')
+    plt.title('各BMI分组的综合风险曲线对比')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    plt.savefig('Q3-所有分组风险曲线对比.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+# 绘制特征重要性图（原有代码保留，适配模型可能未训练的情况）
+if 'feature_importance' in locals():
+    plt.figure(figsize=(10, 6))
+    plt.barh(feature_importance['feature'], feature_importance['importance'])
+    plt.xlabel('重要性')
+    plt.title('影响最早达标时间的因素重要性')
+    plt.tight_layout()
+    plt.savefig('Q3-特征重要性.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+print("\n所有图表已保存完毕！")
+print("文件名说明:")
+print("- Q3-各变量风险权重系数图.png: 各变量对风险权重的影响系数（新增）")
+print("- Q3-BMI分组X_考虑误差的生存曲线.png: 各分组的考虑检测误差的未达标概率曲线")
+print("- Q3-BMI分组X_风险曲线.png: 各分组的风险分解曲线")
+print("- Q3-所有分组风险曲线对比.png: 所有分组的风险对比")
+print("- Q3-特征重要性.png: 影响最早达标时间的因素重要性")
