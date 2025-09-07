@@ -1,0 +1,616 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+
+# 使用Agg后端，避免GUI显示问题
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, roc_auc_score, roc_curve, confusion_matrix, precision_recall_curve, \
+    f1_score, precision_recall_fscore_support, accuracy_score
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif, RFE
+from imblearn.over_sampling import SMOTE, ADASYN
+from imblearn.pipeline import Pipeline as ImbPipeline
+import xgboost as xgb
+import warnings
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 第2步：数据加载和列名检查
+data = pd.read_csv('女胎检测.csv')
+print(f"\n数据基本信息：")
+print(f"数据维度: {data.shape}")
+print(f"异常标签分布:")
+print(data['染色体的非整倍体'].value_counts())
+
+# 创建二元分类标签
+data['异常标签'] = data['染色体的非整倍体'].notna().astype(int)
+print(f"异常样本数: {data['异常标签'].sum()}")
+print(f"正常样本数: {(data['异常标签'] == 0).sum()}")
+print(f"类别不平衡比例: {data['异常标签'].mean():.4f}")
+
+# 第3步：智能特征选择
+available_columns = data.columns.tolist()
+
+# 核心Z值特征
+z_features = [col for col in ['13号染色体的Z值', '18号染色体的Z值', '21号染色体的Z值', 'X染色体的Z值']
+              if col in available_columns]
+
+# GC含量特征
+gc_features = [col for col in ['13号染色体的GC含量', '18号染色体的GC含量', '21号染色体的GC含量']
+               if col in available_columns]
+
+# 测序质量特征
+quality_cols = ['原始测序数据的总读段数', '总读段数中唯一比对的读段数', '被过滤掉的读段数占总读段数的比例',
+                '总读段数中在参考基因组上比对的比例', '总读段数中重复读段的比例', 'GC含量']
+quality_features = [col for col in quality_cols if col in available_columns]
+
+# 孕妇特征
+maternal_features = [col for col in ['孕妇BMI', '年龄'] if col in available_columns]
+
+# 合并特征
+all_features = z_features + gc_features + quality_features + maternal_features
+print(f"\n可用特征 ({len(all_features)}个):")
+for i, feature in enumerate(all_features, 1):
+    print(f"{i:2d}. {feature}")
+
+# 第4步：数据清洗和质量控制
+clean_data = data[all_features + ['异常标签']].dropna()
+print(f"\n数据清洗结果:")
+print(f"清洗前: {len(data)} -> 清洗后: {len(clean_data)}")
+print(f"清洗后异常比例: {clean_data['异常标签'].mean():.4f}")
+
+# 第5步：高级特征选择（多方法综合评估）
+X_raw = clean_data[all_features]
+y = clean_data['异常标签']
+
+# 方法1: F检验（线性关系）
+f_selector = SelectKBest(score_func=f_classif, k='all')
+f_selector.fit(X_raw, y)
+f_scores = f_selector.scores_
+
+# 方法2: 互信息（非线性关系）
+mi_selector = SelectKBest(score_func=mutual_info_classif, k='all')
+mi_selector.fit(X_raw, y)
+mi_scores = mi_selector.scores_
+
+# 方法3: 随机森林特征重要性
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(X_raw, y)
+rf_scores = rf.feature_importances_
+
+# 综合评分（标准化后加权平均）
+f_scores_norm = (f_scores - np.min(f_scores)) / (np.max(f_scores) - np.min(f_scores))
+mi_scores_norm = (mi_scores - np.min(mi_scores)) / (np.max(mi_scores) - np.min(mi_scores))
+rf_scores_norm = (rf_scores - np.min(rf_scores)) / (np.max(rf_scores) - np.min(rf_scores))
+
+# 加权综合评分（可根据领域知识调整权重）
+combined_scores = 0.4 * f_scores_norm + 0.4 * mi_scores_norm + 0.2 * rf_scores_norm
+
+# 选择前10个特征
+n_features = min(10, len(all_features))
+top_indices = np.argsort(combined_scores)[::-1][:n_features]
+selected_features = [all_features[i] for i in top_indices]
+selected_scores = [combined_scores[i] for i in top_indices]
+
+print(f"\n综合特征选择结果 ({len(selected_features)}个):")
+for i, (feature, score) in enumerate(zip(selected_features, selected_scores), 1):
+    print(f"{i}. {feature}: {score:.4f}")
+
+# 可视化特征得分
+plt.figure(figsize=(12, 8))
+indices = np.argsort(selected_scores)[::-1]
+sorted_features = [selected_features[i] for i in indices]
+sorted_scores = [selected_scores[i] for i in indices]
+
+bars = plt.barh(range(len(sorted_features)), sorted_scores, alpha=0.8, color='steelblue')
+plt.yticks(range(len(sorted_features)), sorted_features, fontsize=10)
+plt.xlabel('综合特征重要性得分')
+plt.title('多方法综合特征重要性排序')
+plt.grid(True, alpha=0.3)
+
+# 添加数值标注
+for i, (bar, score) in enumerate(zip(bars, sorted_scores)):
+    plt.text(bar.get_width() + max(sorted_scores) * 0.01, bar.get_y() + bar.get_height() / 2,
+             f'{score:.4f}', ha='left', va='center', fontsize=9)
+
+plt.tight_layout()
+plt.savefig('特征重要性.png', dpi=300, bbox_inches='tight')
+print("特征重要性图表已保存为 '特征重要性.png'")
+
+# 第6步：数据分割（分层采样）
+X = clean_data[selected_features]
+y = clean_data['异常标签']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, random_state=42, stratify=y
+)
+
+print(f"\n原始数据分布:")
+print(f"训练集: {X_train.shape}, 异常比例: {y_train.mean():.4f}")
+print(f"测试集: {X_test.shape}, 异常比例: {y_test.mean():.4f}")
+
+# 第7步：数据过采样处理不平衡（优化SMOTE参数）
+# 使用网格搜索优化SMOTE参数
+best_smote = SMOTE(random_state=42, k_neighbors=5)  # 默认参数，实际应用中可以使用网格搜索优化
+
+X_train_smote, y_train_smote = best_smote.fit_resample(X_train, y_train)
+
+print(f"\n过采样后数据分布:")
+print(f"SMOTE: {X_train_smote.shape}, 异常比例: {y_train_smote.mean():.4f}")
+
+# 第8步：特征标准化
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+X_train_smote_scaled = scaler.fit_transform(X_train_smote)
+
+# 第9步：构建多模型并选择最佳模型
+models_config = {
+    '逻辑回归': {
+        'model': LogisticRegression(random_state=42, class_weight='balanced', max_iter=1000),
+        'use_scaled': True,
+        'data_type': 'original'
+    },
+    '随机森林': {
+        'model': RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced'),
+        'use_scaled': False,
+        'data_type': 'original'
+    },
+    'XGBoost': {
+        'model': xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            scale_pos_weight=len(y_train[y_train == 0]) / len(y_train[y_train == 1])
+        ),
+        'use_scaled': False,
+        'data_type': 'original'
+    },
+    'XGBoost+SMOTE': {
+        'model': xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42
+        ),
+        'use_scaled': False,
+        'data_type': 'smote'
+    }
+}
+
+model_results = {}
+detailed_metrics = {}
+
+print(f"\n模型训练进度:")
+for name, config in models_config.items():
+    print(f"正在训练: {name}...")
+
+    model = config['model']
+
+    # 选择训练数据
+    if config['data_type'] == 'smote':
+        X_train_use = X_train_smote_scaled if config['use_scaled'] else X_train_smote
+        y_train_use = y_train_smote
+    else:
+        X_train_use = X_train_scaled if config['use_scaled'] else X_train
+        y_train_use = y_train
+
+    # 选择测试数据
+    X_test_use = X_test_scaled if config['use_scaled'] else X_test
+
+    # 训练模型
+    model.fit(X_train_use, y_train_use)
+
+    # 预测
+    y_pred = model.predict(X_test_use)
+    y_proba = model.predict_proba(X_test_use)[:, 1]
+
+    # 交叉验证（使用分层K折）
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores = cross_val_score(model, X_train_use, y_train_use, cv=skf, scoring='roc_auc')
+
+    # 计算性能指标
+    test_auc = roc_auc_score(y_test, y_proba)
+
+    # 计算精确率、召回率和F1分数
+    precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary')
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    # 计算特异性
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    model_results[name] = {
+        'model': model,
+        'config': config,
+        'cv_mean': cv_scores.mean(),
+        'cv_std': cv_scores.std(),
+        'test_auc': test_auc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'specificity': specificity,
+        'y_pred': y_pred,
+        'y_proba': y_proba,
+        'cm': cm
+    }
+
+    detailed_metrics[name] = {
+        'TP': tp, 'FP': fp, 'FN': fn, 'TN': tn,
+        'Precision': precision, 'Recall': recall, 'F1': f1, 'Specificity': specificity
+    }
+
+    print(f"  {name}: AUC={test_auc:.4f}, Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+# 第10步：选择最佳模型（基于F1分数，因为它是精确率和召回率的调和平均）
+# 可以根据实际需求调整选择标准（如更注重召回率）
+best_model_name = max(model_results.keys(), key=lambda x: model_results[x]['f1'])
+best_model = model_results[best_model_name]['model']
+print(f"\n🏆 最佳模型: {best_model_name}")
+print(f"  AUC: {model_results[best_model_name]['test_auc']:.4f}")
+print(f"  精确率: {model_results[best_model_name]['precision']:.4f}")
+print(f"  召回率: {model_results[best_model_name]['recall']:.4f}")
+print(f"  F1分数: {model_results[best_model_name]['f1']:.4f}")
+print(f"  特异性: {model_results[best_model_name]['specificity']:.4f}")
+
+# 使用Youden指数确定最佳阈值
+fpr, tpr, thresholds = roc_curve(y_test, model_results[best_model_name]['y_proba'])
+youden_index = tpr - fpr
+best_threshold_idx = np.argmax(youden_index)
+best_threshold = thresholds[best_threshold_idx]
+
+print(f"基于Youden指数的最佳阈值: {best_threshold:.4f}")
+
+# 第11步：高级性能评估可视化（分别保存每个子图）
+# 创建6个独立的图形，每个图形包含一个子图
+
+# 11.1 ROC曲线对比
+plt.figure(figsize=(10, 8))
+colors = ['blue', 'green', 'red', 'orange']
+for i, (name, result) in enumerate(model_results.items()):
+    fpr, tpr, _ = roc_curve(y_test, result['y_proba'])
+    plt.plot(fpr, tpr, linewidth=2, color=colors[i % len(colors)],
+             label=f'{name} (AUC={result["test_auc"]:.3f})')
+
+plt.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='随机分类器')
+plt.xlabel('假阳性率')
+plt.ylabel('真阳性率')
+plt.title('ROC曲线对比')
+plt.legend(fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('ROC曲线对比.png', dpi=300, bbox_inches='tight')
+print("ROC曲线图表已保存为 'ROC曲线对比.png'")
+
+# 11.2 模型性能对比（F1和AUC）
+plt.figure(figsize=(10, 8))
+models = list(model_results.keys())
+f1_scores = [model_results[m]['f1'] for m in models]
+auc_scores = [model_results[m]['test_auc'] for m in models]
+
+x = np.arange(len(models))
+width = 0.35
+
+bars1 = plt.bar(x - width / 2, f1_scores, width, label='F1分数', alpha=0.8)
+bars2 = plt.bar(x + width / 2, auc_scores, width, label='AUC', alpha=0.8)
+
+plt.xlabel('模型')
+plt.ylabel('分数')
+plt.title('模型性能对比 (F1和AUC)')
+plt.xticks(x, models, rotation=45, ha='right')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# 添加数值标注
+for bars in [bars1, bars2]:
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
+                 f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+
+plt.tight_layout()
+plt.savefig('模型性能对比.png', dpi=300, bbox_inches='tight')
+print("模型性能对比图表已保存为 '模型性能对比.png'")
+
+# 11.3 精确率-召回率曲线
+plt.figure(figsize=(10, 8))
+for i, (name, result) in enumerate(model_results.items()):
+    precision, recall, _ = precision_recall_curve(y_test, result['y_proba'])
+    plt.plot(recall, precision, linewidth=2, color=colors[i % len(colors)],
+             label=f'{name}')
+
+plt.xlabel('召回率')
+plt.ylabel('精确率')
+plt.title('精确率-召回率曲线')
+plt.legend(fontsize=9)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('精确率-召回率曲线.png', dpi=300, bbox_inches='tight')
+print("精确率-召回率曲线图表已保存为 '精确率-召回率曲线.png'")
+
+# 11.4 最佳模型混淆矩阵
+plt.figure(figsize=(8, 6))
+cm = model_results[best_model_name]['cm']
+plt.imshow(cm, interpolation='nearest', cmap='Blues')
+
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, cm[i, j], ha="center", va="center",
+                 color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=12)
+
+plt.title(
+    f'{best_model_name} 混淆矩阵\nPrecision={model_results[best_model_name]["precision"]:.3f}, Recall={model_results[best_model_name]["recall"]:.3f}')
+plt.xlabel('预测标签')
+plt.ylabel('真实标签')
+plt.xticks([0, 1], ['正常', '异常'])
+plt.yticks([0, 1], ['正常', '异常'])
+plt.tight_layout()
+plt.savefig('混淆矩阵.png', dpi=300, bbox_inches='tight')
+print("混淆矩阵图表已保存为 '混淆矩阵.png'")
+
+# 11.5 特征重要性（最佳模型）
+plt.figure(figsize=(10, 8))
+if hasattr(best_model, 'feature_importances_'):
+    importance_scores = best_model.feature_importances_
+    indices = np.argsort(importance_scores)[::-1]
+
+    plt.barh(range(len(indices)), importance_scores[indices], alpha=0.8)
+    plt.yticks(range(len(indices)), [selected_features[i] for i in indices], fontsize=8)
+    plt.xlabel('特征重要性')
+    plt.title(f'{best_model_name}特征重要性')
+    plt.grid(True, alpha=0.3)
+else:
+    plt.text(0.5, 0.5, '该模型无特征重要性', ha='center', va='center', transform=plt.gca().transAxes)
+    plt.title('特征重要性不可用')
+
+plt.tight_layout()
+plt.savefig('特征重要性_最佳模型.png', dpi=300, bbox_inches='tight')
+print("特征重要性图表已保存为 '特征重要性_最佳模型.png'")
+
+# 11.6 阈值分析
+plt.figure(figsize=(10, 8))
+plt.plot(thresholds, youden_index, 'b-', label='Youden指数')
+plt.axvline(x=best_threshold, color='r', linestyle='--', label=f'最佳阈值: {best_threshold:.3f}')
+plt.xlabel('阈值')
+plt.ylabel('Youden指数 (敏感度 + 特异度 - 1)')
+plt.title('阈值与Youden指数关系')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('阈值分析.png', dpi=300, bbox_inches='tight')
+print("阈值分析图表已保存为 '阈值分析.png'")
+
+# 第12步：通过X染色体浓度评估模型预测概率的准确度
+if 'X染色体的Z值' in clean_data.columns:
+    # 计算所有测试样本的预测概率
+    X_test_scaled = scaler.transform(X_test)
+    y_proba_all = best_model.predict_proba(X_test_scaled)[:, 1]
+
+    # 将测试集数据与预测概率合并
+    test_data_with_proba = X_test.copy()
+    test_data_with_proba['X染色体的Z值'] = clean_data.loc[X_test.index, 'X染色体的Z值']
+    test_data_with_proba['真实标签'] = y_test.values
+    test_data_with_proba['预测概率'] = y_proba_all
+
+    # 根据X染色体Z值分组
+    x_z_normal = test_data_with_proba[(test_data_with_proba['X染色体的Z值'] >= -3) &
+                                      (test_data_with_proba['X染色体的Z值'] <= 3)]
+    x_z_abnormal = test_data_with_proba[(test_data_with_proba['X染色体的Z值'] < -3) |
+                                        (test_data_with_proba['X染色体的Z值'] > 3)]
+
+    print(f"\n=== X染色体浓度对预测准确度的影响分析 ===")
+    print(f"X染色体浓度正常样本数: {len(x_z_normal)}")
+    print(f"X染色体浓度异常样本数: {len(x_z_abnormal)}")
+
+    # 计算不同X染色体浓度组的预测准确度
+    if len(x_z_normal) > 0:
+        # 使用最佳阈值进行二分类预测
+        y_pred_normal = (x_z_normal['预测概率'] >= best_threshold).astype(int)
+        accuracy_normal = accuracy_score(x_z_normal['真实标签'], y_pred_normal)
+        print(f"X染色体浓度正常组的预测准确度: {accuracy_normal:.4f}")
+
+    if len(x_z_abnormal) > 0:
+        y_pred_abnormal = (x_z_abnormal['预测概率'] >= best_threshold).astype(int)
+        accuracy_abnormal = accuracy_score(x_z_abnormal['真实标签'], y_pred_abnormal)
+        print(f"X染色体浓度异常组的预测准确度: {accuracy_abnormal:.4f}")
+
+    # 计算预测概率与X染色体Z值的相关性
+    correlation = np.corrcoef(test_data_with_proba['X染色体的Z值'], test_data_with_proba['预测概率'])[0, 1]
+    print(f"X染色体Z值与预测概率的相关系数: {correlation:.4f}")
+
+    # 可视化X染色体Z值与预测概率的关系
+    plt.figure(figsize=(12, 8))
+
+    # 绘制散点图
+    plt.scatter(test_data_with_proba['X染色体的Z值'], test_data_with_proba['预测概率'],
+                c=test_data_with_proba['真实标签'], cmap='coolwarm', alpha=0.6)
+    plt.colorbar(label='真实标签 (0=正常, 1=异常)')
+
+    # 添加正常范围标记
+    plt.axvline(x=-3, color='red', linestyle='--', alpha=0.7, label='正常范围下限 (Z=-3)')
+    plt.axvline(x=3, color='red', linestyle='--', alpha=0.7, label='正常范围上限 (Z=3)')
+
+    plt.xlabel('X染色体Z值')
+    plt.ylabel('预测概率')
+    plt.title('X染色体Z值与预测概率的关系')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('X染色体Z值与预测概率关系.png', dpi=300, bbox_inches='tight')
+    print("X染色体Z值与预测概率关系图表已保存为 'X染色体Z值与预测概率关系.png'")
+
+    # 绘制X染色体Z值分布与预测准确度的关系
+    plt.figure(figsize=(12, 8))
+
+    # 创建Z值区间
+    z_bins = np.arange(-6, 6.5, 0.5)
+    z_centers = (z_bins[:-1] + z_bins[1:]) / 2
+    accuracies = []
+    counts = []
+
+    for i in range(len(z_bins) - 1):
+        bin_mask = (test_data_with_proba['X染色体的Z值'] >= z_bins[i]) & (
+                    test_data_with_proba['X染色体的Z值'] < z_bins[i + 1])
+        bin_data = test_data_with_proba[bin_mask]
+
+        if len(bin_data) > 0:
+            y_pred_bin = (bin_data['预测概率'] >= best_threshold).astype(int)
+            accuracy_bin = accuracy_score(bin_data['真实标签'], y_pred_bin)
+            accuracies.append(accuracy_bin)
+            counts.append(len(bin_data))
+        else:
+            accuracies.append(np.nan)
+            counts.append(0)
+
+    # 绘制准确度曲线
+    fig, ax1 = plt.subplots(figsize=(12, 8))
+
+    color = 'tab:blue'
+    ax1.set_xlabel('X染色体Z值')
+    ax1.set_ylabel('预测准确度', color=color)
+    ax1.plot(z_centers, accuracies, 'o-', color=color, label='预测准确度')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.axvline(x=-3, color='red', linestyle='--', alpha=0.7, label='正常范围界限')
+    ax1.axvline(x=3, color='red', linestyle='--', alpha=0.7)
+    ax1.set_ylim(0, 1.05)
+
+    # 添加样本数量柱状图
+    ax2 = ax1.twinx()
+    color = 'tab:green'
+    ax2.set_ylabel('样本数量', color=color)
+    ax2.bar(z_centers, counts, alpha=0.3, color=color, width=0.4, label='样本数量')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    plt.title('X染色体Z值与预测准确度的关系')
+    fig.tight_layout()
+    plt.savefig('X染色体Z值与预测准确度关系.png', dpi=300, bbox_inches='tight')
+    print("X染色体Z值与预测准确度关系图表已保存为 'X染色体Z值与预测准确度关系.png'")
+
+else:
+    print("\n数据中未找到X染色体的Z值信息，无法进行X染色体浓度准确度分析")
+
+
+# 第13步：构建优化版异常检测系统（使用单一最佳模型）
+class OptimizedAnomalyDetector:
+    def __init__(self, model, scaler, features, threshold=None):
+        self.model = model
+        self.scaler = scaler
+        self.features = features
+        self.threshold = threshold if threshold is not None else 0.5
+
+    def predict_risk(self, patient_data):
+        """使用最佳模型预测风险"""
+        # 准备输入数据
+        X = patient_data[self.features].values.reshape(1, -1)
+
+        # 标准化特征
+        X_scaled = self.scaler.transform(X)
+
+        # 预测概率 - 确保返回单个值而不是数组
+        proba = self.model.predict_proba(X_scaled)
+        prob = proba[0, 1] if len(proba.shape) > 1 else proba[0]
+
+        # 使用最佳阈值进行风险分层
+        if prob < 0.15:
+            risk_level = "低风险"
+            recommendation = "继续常规产检，6个月后复查"
+        elif prob < 0.45:
+            risk_level = "中风险"
+            recommendation = "建议2周内遗传咨询，考虑无创DNA复检"
+        else:
+            risk_level = "高风险"
+            recommendation = "立即安排羊水穿刺确诊，遗传科会诊"
+
+        return {
+            '预测概率': float(prob),  # 确保返回浮点数
+            '风险等级': risk_level,
+            '临床建议': recommendation
+        }
+
+# 创建优化检测器
+optimized_detector = OptimizedAnomalyDetector(best_model, scaler, selected_features, best_threshold)
+
+# 第14步：高级应用演示
+print(f"\n=== 女胎异常检测系统演示 (使用最佳模型: {best_model_name}) ===")
+
+demo_samples = clean_data.sample(min(5, len(clean_data)), random_state=42)
+
+# 定义要展示的关键孕妇信息
+key_maternal_info = ['孕妇BMI', '年龄']
+
+for idx, (_, patient) in enumerate(demo_samples.iterrows()):
+    result = optimized_detector.predict_risk(patient)
+    actual = "异常" if patient['异常标签'] == 1 else "正常"
+
+    print(f"\n【患者 {idx + 1}】")
+
+    # 输出孕妇基本信息
+    print("孕妇基本信息:")
+    for info in key_maternal_info:
+        if info in patient and not pd.isna(patient[info]):
+            print(f"  {info}: {patient[info]:.2f}")
+
+    # 输出测序质量关键指标
+    print("测序质量关键指标:")
+    seq_quality_metrics = ['原始测序数据的总读段数', '总读段数中唯一比对的读段数',
+                           '被过滤掉的读段数占总读段数的比例', '总读段数中在参考基因组上比对的比例']
+    for metric in seq_quality_metrics:
+        if metric in patient and not pd.isna(patient[metric]):
+            print(f"  {metric}: {patient[metric]:.2f}")
+
+    # 输出X染色体信息（如果存在）
+    if 'X染色体的Z值' in patient and not pd.isna(patient['X染色体的Z值']):
+        x_z_value = patient['X染色体的Z值']
+        x_z_status = "正常" if -3 <= x_z_value <= 3 else "异常"
+        print(f"  X染色体Z值: {x_z_value:.2f} ({x_z_status})")
+
+    print(f"真实状态: {actual}")
+    print(f"预测概率: {result['预测概率']:.4f}")
+    print(f"风险等级: {result['风险等级']}")
+    print(f"临床建议: {result['临床建议']}")
+
+    # 输出特征权重信息
+    print("关键特征值:")
+    for feature, score in zip(selected_features, selected_scores):
+        if feature in patient and not pd.isna(patient[feature]):
+            print(f"  {feature}: {patient[feature]:.2f} (重要性: {score:.4f})")
+
+    # Z值异常分析
+    if z_features:
+        z_abnormal = []
+        z_values_info = []
+        for z_feat in z_features:
+            if z_feat in patient and not pd.isna(patient[z_feat]):
+                z_val = patient[z_feat]
+                chromosome = z_feat.replace('号染色体的Z值', '')
+                z_values_info.append(f"{chromosome}: {z_val:.2f}")
+                if abs(z_val) > 3:
+                    z_abnormal.append(f"{chromosome}({z_val:.2f})")
+
+        # 输出所有Z值信息
+        print("染色体Z值:")
+        for z_info in z_values_info:
+            print(f"  {z_info}")
+
+        # 输出异常Z值指标
+        if z_abnormal:
+            print(f"异常Z值指标: {', '.join(z_abnormal)}")
+        else:
+            print("所有染色体Z值均在正常范围内")
+
+    print("-" * 50)
+
+# 输出详细性能指标表格
+print("\n=== 所有模型详细性能指标 ===")
+metrics_df = pd.DataFrame(detailed_metrics).T
+print(metrics_df.round(4))
